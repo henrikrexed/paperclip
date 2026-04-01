@@ -18,4 +18,10 @@ export const METRIC_NAMES = {
   approvalsCreated: "paperclip.approvals.created",
   approvalsDecided: "paperclip.approvals.decided",
   eventsTotal: "paperclip.events.total",
+
+  // Gauge metrics (scheduled job)
+  agentsCount: "paperclip.agents.count",
+  agentsHeartbeatAge: "paperclip.agents.heartbeat.age_seconds",
+  budgetUtilization: "paperclip.budget.utilization",
+  budgetRemaining: "paperclip.budget.remaining_cents",
 } as const;
