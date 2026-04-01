@@ -156,7 +156,7 @@ async function handleAgentRunFinished(
     });
     genAIDurationHist.record(durationMs / 1000, {
       "gen_ai.operation.name": "invoke_agent",
-      "gen_ai.provider.name": String(p.provider ?? "anthropic"),
+      "gen_ai.provider.name": mapProvider(String(p.provider ?? "anthropic")),
       "gen_ai.request.model": String(p.model ?? "unknown"),
     });
   }
