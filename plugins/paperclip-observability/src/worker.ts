@@ -14,6 +14,7 @@ import {
   type PluginEvent,
   type PluginHealthDiagnostics,
   type PluginJobContext,
+  type Agent,
 } from "@paperclipai/plugin-sdk";
 import type { ObservabilityConfig } from "./config.js";
 import { DEFAULT_CONFIG, resolveConfig } from "./config.js";
@@ -29,6 +30,19 @@ let ctx: PluginContext | null = null;
 let startedAt: string | null = null;
 let eventsProcessed = 0;
 let lastError: string | null = null;
+
+// Gauge snapshot data — written by the collect-metrics job, read by observable gauge callbacks
+interface AgentSnapshot {
+  agentId: string;
+  agentName: string;
+  agentRole: string;
+  companyId: string;
+  status: string;
+  heartbeatAgeSec: number | null;
+  budgetMonthlyCents: number;
+  spentMonthlyCents: number;
+}
+let agentSnapshots: AgentSnapshot[] = [];
 
 // ---------------------------------------------------------------------------
 // Provider name mapping (adapter type → OTel well-known value)
@@ -404,21 +418,128 @@ const plugin: PaperclipPlugin = definePlugin({
 
     ctx.events.on("activity.logged", handleGenericEvent);
 
-    // ----- Register collect-metrics job -----
+    // ----- Register observable gauges (read from agentSnapshots) -----
+
+    if (otel) {
+    const agentCountGauge = otel.meter.createObservableGauge(
+      METRIC_NAMES.agentsCount,
+      { description: "Number of agents by status" },
+    );
+    agentCountGauge.addCallback((obs) => {
+      const seen = new Map<string, { count: number; companyId: string; status: string }>();
+      for (const snap of agentSnapshots) {
+        const key = `${snap.companyId}:${snap.status}`;
+        const entry = seen.get(key);
+        if (entry) {
+          entry.count++;
+        } else {
+          seen.set(key, { count: 1, companyId: snap.companyId, status: snap.status });
+        }
+      }
+      for (const { count, companyId, status } of seen.values()) {
+        obs.observe(count, { status, company_id: companyId });
+      }
+    });
+
+    const heartbeatAgeGauge = otel.meter.createObservableGauge(
+      METRIC_NAMES.agentsHeartbeatAge,
+      { description: "Seconds since last agent heartbeat", unit: "s" },
+    );
+    heartbeatAgeGauge.addCallback((obs) => {
+      for (const snap of agentSnapshots) {
+        if (snap.heartbeatAgeSec != null) {
+          obs.observe(snap.heartbeatAgeSec, {
+            agent_id: snap.agentId,
+            agent_name: snap.agentName,
+            agent_role: snap.agentRole,
+            company_id: snap.companyId,
+          });
+        }
+      }
+    });
+
+    const budgetUtilGauge = otel.meter.createObservableGauge(
+      METRIC_NAMES.budgetUtilization,
+      { description: "Budget utilization percentage" },
+    );
+    budgetUtilGauge.addCallback((obs) => {
+      for (const snap of agentSnapshots) {
+        if (snap.budgetMonthlyCents > 0) {
+          const utilPct = (snap.spentMonthlyCents / snap.budgetMonthlyCents) * 100;
+          obs.observe(utilPct, {
+            agent_id: snap.agentId,
+            agent_name: snap.agentName,
+            company_id: snap.companyId,
+            scope: "agent",
+          });
+        }
+      }
+    });
+
+    const budgetRemainingGauge = otel.meter.createObservableGauge(
+      METRIC_NAMES.budgetRemaining,
+      { description: "Remaining budget in cents", unit: "cent" },
+    );
+    budgetRemainingGauge.addCallback((obs) => {
+      for (const snap of agentSnapshots) {
+        if (snap.budgetMonthlyCents > 0) {
+          obs.observe(snap.budgetMonthlyCents - snap.spentMonthlyCents, {
+            agent_id: snap.agentId,
+            agent_name: snap.agentName,
+            company_id: snap.companyId,
+          });
+        }
+      }
+    });
+    } // end if (otel) — gauge registration
+
+    // ----- Register collect-metrics job (refreshes agentSnapshots) -----
 
     ctx.jobs.register(
       JOB_KEYS.collectMetrics,
       async (_job: PluginJobContext) => {
-        if (!otel || !ctx) return;
+        if (!ctx) return;
 
-        ctx.logger.info("Collecting gauge metrics");
+        ctx.logger.info("Collecting agent health snapshots");
 
-        // Future: query ctx.agents.list / ctx.issues.list to record gauge
-        // snapshots (active agent count, open issue count, etc.)
+        const companies = await ctx.companies.list({ limit: 100, offset: 0 });
+        const now = Date.now();
+        const snapshots: AgentSnapshot[] = [];
+
+        for (const company of companies) {
+          const agents = await ctx.agents.list({
+            companyId: company.id,
+            limit: 200,
+            offset: 0,
+          });
+
+          for (const agent of agents as Agent[]) {
+            const lastHb = agent.lastHeartbeatAt
+              ? new Date(agent.lastHeartbeatAt).getTime()
+              : null;
+
+            snapshots.push({
+              agentId: agent.id,
+              agentName: agent.name,
+              agentRole: agent.role,
+              companyId: company.id,
+              status: agent.status,
+              heartbeatAgeSec: lastHb != null ? (now - lastHb) / 1000 : null,
+              budgetMonthlyCents: agent.budgetMonthlyCents,
+              spentMonthlyCents: agent.spentMonthlyCents,
+            });
+          }
+        }
+
+        agentSnapshots = snapshots;
+        ctx.logger.info("Agent health snapshots updated", {
+          agentCount: snapshots.length,
+          companyCount: companies.length,
+        });
 
         await ctx.activity.log({
           companyId: "",
-          message: `Metrics collection — ${eventsProcessed} events processed since startup`,
+          message: `Metrics collection — ${snapshots.length} agents, ${eventsProcessed} events processed since startup`,
         });
       },
     );
