@@ -8,6 +8,7 @@
  */
 
 import type { Meter, Tracer, Span } from "@opentelemetry/api";
+import type { Logger } from "@opentelemetry/api-logs";
 import type {
   PluginEvent,
   PluginStateClient,
@@ -23,6 +24,9 @@ export interface TelemetryContext {
   tracer: Tracer;
   state: PluginStateClient;
   logger: PluginLogger;
+
+  /** OTel Logger for structured log export via OTLP. Null if logs are disabled. */
+  otelLogger: Logger | null;
 
   /** Active run spans — keyed by runId, kept open until run.finished/failed/cancelled. */
   activeRunSpans: Map<string, Span>;

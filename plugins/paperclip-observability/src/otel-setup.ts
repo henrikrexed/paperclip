@@ -15,12 +15,18 @@ import {
 } from "@opentelemetry/semantic-conventions";
 import { OTLPMetricExporter } from "@opentelemetry/exporter-metrics-otlp-proto";
 import { OTLPTraceExporter } from "@opentelemetry/exporter-trace-otlp-proto";
+import { OTLPLogExporter } from "@opentelemetry/exporter-logs-otlp-proto";
 import {
   AggregationType,
   PeriodicExportingMetricReader,
 } from "@opentelemetry/sdk-metrics";
 import type { ViewOptions } from "@opentelemetry/sdk-metrics";
+import {
+  LoggerProvider,
+  SimpleLogRecordProcessor,
+} from "@opentelemetry/sdk-logs";
 import { metrics, trace, type Tracer, type Meter } from "@opentelemetry/api";
+import { logs, type Logger } from "@opentelemetry/api-logs";
 import type { ObservabilityConfig } from "./config.js";
 import { PLUGIN_ID } from "./constants.js";
 
@@ -48,6 +54,7 @@ export interface OTelHandle {
   sdk: NodeSDK;
   tracer: Tracer;
   meter: Meter;
+  otelLogger: Logger | null;
   shutdown(): Promise<void>;
 }
 
@@ -113,11 +120,32 @@ export function initOTel(config: ObservabilityConfig): OTelHandle {
   const tracer = trace.getTracer(PLUGIN_ID, config.serviceVersion);
   const meter = metrics.getMeter(PLUGIN_ID, config.serviceVersion);
 
+  // Set up OTel LoggerProvider for structured log export
+  let loggerProvider: LoggerProvider | null = null;
+  let otelLogger: Logger | null = null;
+
+  if (config.enableLogs) {
+    loggerProvider = new LoggerProvider({
+      resource,
+      processors: [
+        new SimpleLogRecordProcessor(
+          new OTLPLogExporter({ url: `${config.otlpEndpoint}/v1/logs` }),
+        ),
+      ],
+    });
+    logs.setGlobalLoggerProvider(loggerProvider);
+    otelLogger = logs.getLogger(PLUGIN_ID, config.serviceVersion);
+  }
+
   return {
     sdk,
     tracer,
     meter,
+    otelLogger,
     async shutdown() {
+      if (loggerProvider) {
+        await loggerProvider.shutdown();
+      }
       await sdk.shutdown();
     },
   };
