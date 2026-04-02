@@ -73,10 +73,23 @@ export function costRoutes(db: Db) {
       actorType: actor.actorType,
       actorId: actor.actorId,
       agentId: actor.agentId,
-      action: "cost.reported",
+      runId: event.heartbeatRunId ?? undefined,
+      action: "cost_event.created",
       entityType: "cost_event",
       entityId: event.id,
-      details: { costCents: event.costCents, model: event.model },
+      details: {
+        costCents: event.costCents,
+        model: event.model,
+        provider: event.provider,
+        biller: event.biller,
+        billingType: event.billingType,
+        inputTokens: event.inputTokens,
+        cachedInputTokens: event.cachedInputTokens,
+        outputTokens: event.outputTokens,
+        heartbeatRunId: event.heartbeatRunId,
+        agentId: event.agentId,
+        companyId,
+      },
     });
 
     res.status(201).json(event);
