@@ -66,6 +66,7 @@ import {
   handleIssueUpdatedLogs,
   handleApprovalCreatedLogs,
   handleApprovalDecidedLogs,
+  handleCostEventLogs,
 } from "./telemetry/log-handlers.js";
 
 // ---------------------------------------------------------------------------
@@ -143,6 +144,7 @@ function createRouter(): EventTelemetryRouter {
   // cost_event.created
   router.register("cost_event.created", handleCostMetrics);
   router.register("cost_event.created", handleCostTraces);
+  router.register("cost_event.created", handleCostEventLogs);
 
   // issue.created
   router.register("issue.created", handleIssueCreatedMetrics);
@@ -209,6 +211,7 @@ const plugin: PaperclipPlugin = definePlugin({
           tracer: otel.tracer,
           state: ctx.state,
           logger: ctx.logger,
+          otelLogger: otel.otelLogger,
           activeRunSpans,
           activeIssueSpans,
         }

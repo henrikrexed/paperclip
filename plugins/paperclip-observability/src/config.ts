@@ -9,6 +9,7 @@ export interface ObservabilityConfig {
   exportIntervalMs: number;
   enableTracing: boolean;
   enableMetrics: boolean;
+  enableLogs: boolean;
   resourceAttributes: Record<string, string>;
 }
 
@@ -19,6 +20,7 @@ export const DEFAULT_CONFIG: ObservabilityConfig = {
   exportIntervalMs: 60_000,
   enableTracing: true,
   enableMetrics: true,
+  enableLogs: true,
   resourceAttributes: {},
 };
 
@@ -45,6 +47,8 @@ export function resolveConfig(
     enableMetrics:
       (raw.enableMetrics as boolean | undefined) ??
       DEFAULT_CONFIG.enableMetrics,
+    enableLogs:
+      (raw.enableLogs as boolean | undefined) ?? DEFAULT_CONFIG.enableLogs,
     resourceAttributes:
       (raw.resourceAttributes as Record<string, string> | undefined) ??
       DEFAULT_CONFIG.resourceAttributes,
