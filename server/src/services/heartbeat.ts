@@ -1514,6 +1514,7 @@ export function heartbeatService(db: Db) {
         status === "cancelled"  ? "agent.run.cancelled" :
         null;
       if (pluginAction) {
+        const runCtx = parseObject(updated.contextSnapshot);
         void logActivity(db, {
           companyId: updated.companyId,
           actorType: "system",
@@ -1527,8 +1528,14 @@ export function heartbeatService(db: Db) {
             agentId: updated.agentId,
             status: updated.status,
             invocationSource: updated.invocationSource,
+            triggerDetail: updated.triggerDetail ?? null,
+            issueId: readNonEmptyString(runCtx.issueId) ?? null,
             error: updated.error ?? null,
             errorCode: updated.errorCode ?? null,
+            durationMs: updated.startedAt && updated.finishedAt
+              ? new Date(updated.finishedAt).getTime() - new Date(updated.startedAt).getTime()
+              : null,
+            exitCode: updated.exitCode ?? null,
           },
         });
       }
@@ -1832,8 +1839,11 @@ export function heartbeatService(db: Db) {
       runId: claimed.id,
       details: {
         agentId: claimed.agentId,
+        agentName: agent?.name ?? null,
         status: claimed.status,
         invocationSource: claimed.invocationSource,
+        triggerDetail: claimed.triggerDetail ?? null,
+        issueId: readNonEmptyString(context.issueId) ?? null,
       },
     });
 
