@@ -216,6 +216,9 @@ export function createTestTelemetryCtx(overrides: Partial<TelemetryContext> = {}
       getTracerForAgent(_agentId: string, _agentName: string) {
         return tracer as unknown as TelemetryContext["tracer"];
       },
+      projectNameMap: new Map<string, string>(),
+      agentIssueMap: new Map<string, { issueId: string; issueIdentifier: string; projectId: string }>(),
+      issueContextMap: new Map<string, { projectId: string; identifier: string; title: string }>(),
       ...overrides,
     } as TelemetryContext,
     meter,

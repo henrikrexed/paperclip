@@ -15,6 +15,7 @@ import {
 import type { PluginEvent } from "@paperclipai/plugin-sdk";
 import type { TelemetryContext } from "./router.js";
 import { mapProvider } from "../provider-map.js";
+import { METRIC_NAMES } from "../constants.js";
 
 // ---------------------------------------------------------------------------
 // agent.run.started — create run span (child of issue span when available)
@@ -28,27 +29,47 @@ export async function handleRunStartedTraces(
   const runId = String(p.runId ?? "");
   const issueId = String(p.issueId ?? "");
 
-  const spanAttrs = {
-    "paperclip.agent.id": String(p.agentId ?? ""),
+  const agentId = String(p.agentId ?? "");
+  const agentName = String(p.agentName ?? "");
+
+  // Resolve business context from agentIssueMap (primary) or issueContextMap (fallback)
+  const agentIssue = ctx.agentIssueMap.get(agentId);
+  const resolvedIssueId = issueId || agentIssue?.issueId || "";
+  const issueCtx = resolvedIssueId ? ctx.issueContextMap.get(resolvedIssueId) : undefined;
+  const issueIdentifier = agentIssue?.issueIdentifier || issueCtx?.identifier || "";
+  const issueTitle = issueCtx?.title || "";
+  const projectId = agentIssue?.projectId || issueCtx?.projectId || "";
+  const projectName = projectId ? (ctx.projectNameMap.get(projectId) ?? "") : "";
+
+  const spanAttrs: Record<string, string | number | boolean> = {
+    "paperclip.agent.id": agentId,
+    "paperclip.agent.name": agentName,
     "paperclip.run.id": runId,
     "paperclip.company.id": String(p.companyId ?? event.companyId ?? ""),
     "paperclip.run.invocation_source": String(p.invocationSource ?? ""),
     "paperclip.run.trigger_detail": String(p.triggerDetail ?? ""),
-    "paperclip.issue.id": issueId,
+    "paperclip.issue.id": resolvedIssueId,
+    "paperclip.issue.identifier": issueIdentifier,
+    "paperclip.issue.title": issueTitle,
+    "paperclip.project.id": projectId,
+    "paperclip.project.name": projectName,
     "gen_ai.operation.name": "invoke_agent",
-    "gen_ai.agent.id": String(p.agentId ?? ""),
-    "gen_ai.agent.name": String(p.agentName ?? ""),
+    "gen_ai.agent.id": agentId,
+    "gen_ai.agent.name": agentName,
   };
 
+  // Use per-agent tracer so this agent gets its own service.name
+  const tracer = ctx.getTracerForAgent(agentId, agentName);
+
   // Try to parent under the issue execution span for cross-agent context
-  let parentCtx = issueId
-    ? resolveParentContext(ctx, issueId)
+  let parentCtx = resolvedIssueId
+    ? resolveParentContext(ctx, resolvedIssueId)
     : undefined;
 
   // Fallback: restore from plugin state if not in memory
-  if (!parentCtx && issueId) {
+  if (!parentCtx && resolvedIssueId) {
     const stored = await ctx.state
-      .get({ scopeKind: "issue", scopeId: issueId, stateKey: "execution-span" })
+      .get({ scopeKind: "issue", scopeId: resolvedIssueId, stateKey: "execution-span" })
       .catch(() => null);
     if (
       stored &&
@@ -67,12 +88,12 @@ export async function handleRunStartedTraces(
   }
 
   const span = parentCtx
-    ? ctx.tracer.startSpan(
+    ? tracer.startSpan(
         "paperclip.heartbeat.run",
         { kind: SpanKind.INTERNAL, attributes: spanAttrs },
         parentCtx,
       )
-    : ctx.tracer.startSpan("paperclip.heartbeat.run", {
+    : tracer.startSpan("paperclip.heartbeat.run", {
         kind: SpanKind.INTERNAL,
         attributes: spanAttrs,
       });
@@ -213,17 +234,39 @@ export async function handleCostTraces(
   ctx: TelemetryContext,
 ): Promise<void> {
   const p = event.payload as Record<string, unknown>;
+  const agentId = String(p.agentId ?? "");
+  const agentName = String(p.agentName ?? "");
   const provider = mapProvider(String(p.provider ?? ""));
   const model = String(p.model ?? "unknown");
   const spanName = `chat ${model}`;
 
-  const llmSpanAttrs = {
-    "paperclip.agent.id": String(p.agentId ?? ""),
+  // Use per-agent tracer so cost spans appear under the correct service
+  const tracer = ctx.getTracerForAgent(agentId, agentName);
+
+  // Resolve business context from agent's active issue
+  const agentIssue = ctx.agentIssueMap.get(agentId);
+  const costIssueId = agentIssue?.issueId || "";
+  const costIssueCtx = costIssueId ? ctx.issueContextMap.get(costIssueId) : undefined;
+  const costIssueIdentifier = agentIssue?.issueIdentifier || costIssueCtx?.identifier || "";
+  const costIssueTitle = costIssueCtx?.title || "";
+  const costProjectId = agentIssue?.projectId || costIssueCtx?.projectId || "";
+  const costProjectName = costProjectId ? (ctx.projectNameMap.get(costProjectId) ?? "") : "";
+
+  const llmSpanAttrs: Record<string, string | number | boolean> = {
+    "paperclip.agent.id": agentId,
+    "paperclip.agent.name": agentName,
     "paperclip.company.id": String(p.companyId ?? ""),
     "paperclip.cost.cents": Number(p.costCents ?? 0),
     "paperclip.billing.type": String(p.billingType ?? ""),
     "paperclip.billing.biller": String(p.biller ?? ""),
-    "gen_ai.operation.name": "chat" as const,
+    "paperclip.issue.id": costIssueId,
+    "paperclip.issue.identifier": costIssueIdentifier,
+    "paperclip.issue.title": costIssueTitle,
+    "paperclip.project.id": costProjectId,
+    "paperclip.project.name": costProjectName,
+    "gen_ai.operation.name": "chat",
+    "gen_ai.agent.id": agentId,
+    "gen_ai.agent.name": agentName,
     "gen_ai.provider.name": provider,
     "gen_ai.request.model": model,
     "gen_ai.usage.input_tokens": Number(p.inputTokens ?? 0),
@@ -270,12 +313,12 @@ export async function handleCostTraces(
   }
 
   const span = parentCtx
-    ? ctx.tracer.startSpan(
+    ? tracer.startSpan(
         spanName,
         { kind: SpanKind.CLIENT, attributes: llmSpanAttrs },
         parentCtx,
       )
-    : ctx.tracer.startSpan(spanName, {
+    : tracer.startSpan(spanName, {
         kind: SpanKind.CLIENT,
         attributes: llmSpanAttrs,
       });
@@ -295,21 +338,46 @@ export async function handleIssueUpdatedTraces(
   const status = String(p.status ?? "unknown");
   const previousStatus = String(p.previousStatus ?? "");
   const issueId = String(p.id ?? "");
+  const assigneeAgentId = String(p.assigneeAgentId ?? "");
+  const assigneeAgentName = String(p.assigneeAgentName ?? p.executionAgentNameKey ?? "");
+
+  // Use per-agent tracer when an assignee is known
+  const tracer = assigneeAgentId
+    ? ctx.getTracerForAgent(assigneeAgentId, assigneeAgentName)
+    : ctx.tracer;
 
   // Start span when issue transitions to in_progress
   if (status === "in_progress" && previousStatus !== "in_progress" && issueId) {
-    const span = ctx.tracer.startSpan("paperclip.issue.execution", {
+    const projectId = String(p.projectId ?? "");
+    const projectName = ctx.projectNameMap.get(projectId) ?? "";
+    const identifier = String(p.identifier ?? "");
+    const title = String(p.title ?? "");
+
+    const span = tracer.startSpan("paperclip.issue.execution", {
       kind: SpanKind.INTERNAL,
       attributes: {
         "paperclip.issue.id": issueId,
-        "paperclip.issue.identifier": String(p.identifier ?? ""),
-        "paperclip.issue.title": String(p.title ?? ""),
-        "gen_ai.agent.id": String(p.assigneeAgentId ?? ""),
-        "paperclip.project.id": String(p.projectId ?? ""),
-        "paperclip.goal.id": String(p.goalId ?? ""),
+        "paperclip.issue.identifier": identifier,
+        "paperclip.issue.title": title,
         "paperclip.issue.priority": String(p.priority ?? "medium"),
+        "paperclip.issue.status": status,
+        "paperclip.project.id": projectId,
+        "paperclip.project.name": projectName,
+        "paperclip.goal.id": String(p.goalId ?? ""),
+        "paperclip.agent.name": assigneeAgentName,
+        "gen_ai.agent.id": assigneeAgentId,
+        "gen_ai.agent.name": assigneeAgentName,
       },
     });
+
+    // Populate agentIssueMap so run/cost spans can look up business context
+    if (assigneeAgentId) {
+      ctx.agentIssueMap.set(assigneeAgentId, {
+        issueId,
+        issueIdentifier: identifier,
+        projectId,
+      });
+    }
 
     ctx.activeIssueSpans.set(issueId, span);
 
@@ -324,6 +392,14 @@ export async function handleIssueUpdatedTraces(
         },
       )
       .catch(() => {});
+  }
+
+  // Clean up agentIssueMap when issue leaves in_progress
+  if (status !== "in_progress" && assigneeAgentId) {
+    const mapped = ctx.agentIssueMap.get(assigneeAgentId);
+    if (mapped && mapped.issueId === issueId) {
+      ctx.agentIssueMap.delete(assigneeAgentId);
+    }
   }
 
   // End span when issue transitions to done or cancelled
@@ -356,7 +432,7 @@ export async function handleIssueUpdatedTraces(
           traceFlags: s.traceFlags ?? 1,
           isRemote: true,
         });
-        span = ctx.tracer.startSpan(
+        span = tracer.startSpan(
           "paperclip.issue.execution.end",
           {
             kind: SpanKind.INTERNAL,
@@ -391,4 +467,153 @@ export async function handleIssueUpdatedTraces(
       })
       .catch(() => {});
   }
+}
+
+// ---------------------------------------------------------------------------
+// approval.created — start approval lifecycle span
+// ---------------------------------------------------------------------------
+
+export async function handleApprovalCreatedTraces(
+  event: PluginEvent,
+  ctx: TelemetryContext,
+): Promise<void> {
+  const p = event.payload as Record<string, unknown>;
+  const approvalId = String(p.id ?? "");
+  if (!approvalId) return;
+
+  const companyId = String(p.companyId ?? event.companyId ?? "");
+  const requestingAgentId = String(p.requestingAgentId ?? "");
+  const requestingAgentName = String(p.requestingAgentName ?? "");
+  const approvalType = String(p.approvalType ?? p.type ?? "unknown");
+
+  const span = ctx.tracer.startSpan("paperclip.approval.lifecycle", {
+    kind: SpanKind.INTERNAL,
+    attributes: {
+      "paperclip.approval.id": approvalId,
+      "paperclip.company.id": companyId,
+      "paperclip.approval.type": approvalType,
+      "paperclip.approval.requesting_agent.id": requestingAgentId,
+      "paperclip.approval.requesting_agent.name": requestingAgentName,
+    },
+  });
+
+  ctx.activeApprovalSpans.set(approvalId, span);
+
+  // Persist span context for cross-restart resilience
+  await ctx.state
+    .set(
+      { scopeKind: "instance", stateKey: `span:approval:${approvalId}` },
+      {
+        traceId: span.spanContext().traceId,
+        spanId: span.spanContext().spanId,
+        traceFlags: span.spanContext().traceFlags,
+        startTime: Date.now(),
+      },
+    )
+    .catch(() => {});
+}
+
+// ---------------------------------------------------------------------------
+// approval.decided — end approval lifecycle span with decision + latency
+// ---------------------------------------------------------------------------
+
+export async function handleApprovalDecidedTraces(
+  event: PluginEvent,
+  ctx: TelemetryContext,
+): Promise<void> {
+  const p = event.payload as Record<string, unknown>;
+  const approvalId = String(p.id ?? "");
+  if (!approvalId) return;
+
+  const decision = String(p.decision ?? "unknown");
+  const approverAgentId = String(p.approverAgentId ?? p.decidedByAgentId ?? "");
+  const approverUserId = String(p.approverUserId ?? p.decidedByUserId ?? "");
+
+  let span = ctx.activeApprovalSpans.get(approvalId);
+  let startTime: number | null = null;
+
+  // Fallback: restore from plugin state if not in memory
+  if (!span) {
+    const stored = await ctx.state
+      .get({ scopeKind: "instance", stateKey: `span:approval:${approvalId}` })
+      .catch(() => null);
+    if (
+      stored &&
+      typeof stored === "object" &&
+      "traceId" in (stored as Record<string, unknown>) &&
+      "spanId" in (stored as Record<string, unknown>)
+    ) {
+      const s = stored as {
+        traceId: string;
+        spanId: string;
+        traceFlags: number;
+        startTime: number;
+      };
+      startTime = s.startTime ?? null;
+      const restoredCtx = trace.setSpanContext(context.active(), {
+        traceId: s.traceId,
+        spanId: s.spanId,
+        traceFlags: s.traceFlags ?? 1,
+        isRemote: true,
+      });
+      span = ctx.tracer.startSpan(
+        "paperclip.approval.decision",
+        {
+          kind: SpanKind.INTERNAL,
+          attributes: {
+            "paperclip.approval.id": approvalId,
+            "paperclip.approval.decision": decision,
+          },
+        },
+        restoredCtx,
+      );
+    }
+  }
+
+  if (span) {
+    span.setAttribute("paperclip.approval.decision", decision);
+    span.setAttribute("paperclip.approval.approver.agent_id", approverAgentId);
+    span.setAttribute("paperclip.approval.approver.user_id", approverUserId);
+
+    // Compute decision latency from stored start time
+    if (!startTime) {
+      const stored = await ctx.state
+        .get({ scopeKind: "instance", stateKey: `span:approval:${approvalId}` })
+        .catch(() => null);
+      if (stored && typeof stored === "object" && "startTime" in (stored as Record<string, unknown>)) {
+        startTime = (stored as { startTime: number }).startTime;
+      }
+    }
+
+    if (startTime) {
+      const decisionTimeMs = Date.now() - startTime;
+      span.setAttribute("paperclip.approval.decision_time_ms", decisionTimeMs);
+
+      // Record decision latency histogram
+      const histogram = ctx.meter.createHistogram(
+        METRIC_NAMES.approvalDecisionTime,
+        { description: "Approval decision latency in milliseconds", unit: "ms" },
+      );
+      histogram.record(decisionTimeMs, {
+        decision,
+        company_id: String(p.companyId ?? ""),
+      });
+    }
+
+    if (decision === "approved") {
+      span.setStatus({ code: SpanStatusCode.OK });
+    } else if (decision === "rejected") {
+      span.setStatus({ code: SpanStatusCode.OK, message: "rejected" });
+    } else {
+      span.setStatus({ code: SpanStatusCode.UNSET });
+    }
+
+    span.end();
+    ctx.activeApprovalSpans.delete(approvalId);
+  }
+
+  // Clean up persisted state
+  await ctx.state
+    .delete({ scopeKind: "instance", stateKey: `span:approval:${approvalId}` })
+    .catch(() => {});
 }
