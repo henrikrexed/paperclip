@@ -1,5 +1,4 @@
 /// <reference path="./types/express.d.ts" />
-import "./otel.js";
 import { existsSync, readFileSync, rmSync } from "node:fs";
 import { createServer } from "node:http";
 import { resolve } from "node:path";

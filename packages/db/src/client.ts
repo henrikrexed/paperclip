@@ -3,7 +3,6 @@ import { drizzle as drizzlePg } from "drizzle-orm/postgres-js";
 import { migrate as migratePg } from "drizzle-orm/postgres-js/migrator";
 import { readFile, readdir } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
-import { createOTELEmitter } from "otel-instrumentation-postgres";
 import postgres from "postgres";
 import * as schema from "./schema/index.js";
 
@@ -48,8 +47,7 @@ export type MigrationState =
 
 export function createDb(url: string) {
   const sql = postgres(url);
-  const instrumentedSql = createOTELEmitter(sql);
-  return drizzlePg(instrumentedSql, { schema });
+  return drizzlePg(sql, { schema });
 }
 
 export async function getPostgresDataDirectory(url: string): Promise<string | null> {
