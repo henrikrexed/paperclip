@@ -46,6 +46,15 @@ export interface TelemetryContext {
    * Falls back to the default tracer if agentId/agentName are empty.
    */
   getTracerForAgent(agentId: string, agentName: string): Tracer;
+
+  /** projectId → projectName lookup (refreshed by collect-metrics job). */
+  projectNameMap: Map<string, string>;
+
+  /** agentId → active issue context (populated from run.started events). */
+  agentIssueMap: Map<string, { issueId: string; issueIdentifier: string; projectId: string }>;
+
+  /** issueId → { projectId, identifier, title } (refreshed by collect-metrics job). */
+  issueContextMap: Map<string, { projectId: string; identifier: string; title: string }>;
 }
 
 // ---------------------------------------------------------------------------

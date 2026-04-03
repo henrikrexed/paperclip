@@ -84,14 +84,13 @@ export async function handleActivityMetrics(
     company_id: companyId,
   });
 
-  // Track unique actor activity patterns
+  // Track activity patterns by actor type (no actor_id to avoid cardinality explosion)
   const actorCounter = ctx.meter.createCounter(
     METRIC_NAMES.activityActorCount,
-    { description: "Count of activity events by actor" },
+    { description: "Count of activity events by actor type" },
   );
   actorCounter.add(1, {
     actor_type: actorType,
-    actor_id: String(p.actorId ?? ""),
     company_id: companyId,
   });
 }
