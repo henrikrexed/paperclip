@@ -312,7 +312,8 @@ async function dispatchTool(
         return `Error: unknown tool "${name}"`;
     }
   } catch (err) {
-    return `Error calling ${name}: ${err instanceof Error ? err.message : String(err)}`;
+    const msg = err instanceof Error ? err.message : String(err);
+    return JSON.stringify({ __toolError: true, tool: name, message: msg });
   }
 }
 
