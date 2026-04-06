@@ -11,11 +11,47 @@ import {
   SpanStatusCode,
   context,
   trace,
+  type Context,
 } from "@opentelemetry/api";
 import type { PluginEvent } from "@paperclipai/plugin-sdk";
 import type { TelemetryContext } from "./router.js";
 import { mapProvider } from "../provider-map.js";
 import { METRIC_NAMES } from "../constants.js";
+
+// ---------------------------------------------------------------------------
+// W3C Trace Context helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Parse W3C `traceparent` header and return an OTel Context with the remote
+ * span context set. Returns `undefined` when the header is missing or invalid.
+ *
+ * Format: `version-traceId-spanId-traceFlags` (e.g. `"00-abc...def-0123...89ab-01"`)
+ *
+ * @see https://www.w3.org/TR/trace-context/#traceparent-header
+ */
+function extractTraceContext(event: PluginEvent): Context | undefined {
+  const tc = event.traceContext;
+  if (!tc?.traceparent) return undefined;
+
+  const parts = tc.traceparent.split("-");
+  if (parts.length < 4) return undefined;
+
+  const [, traceId, spanId, flagsHex] = parts;
+  if (!traceId || traceId.length !== 32 || !spanId || spanId.length !== 16) {
+    return undefined;
+  }
+
+  const traceFlags = parseInt(flagsHex, 16);
+  if (Number.isNaN(traceFlags)) return undefined;
+
+  return trace.setSpanContext(context.active(), {
+    traceId,
+    spanId,
+    traceFlags,
+    isRemote: true,
+  });
+}
 
 // ---------------------------------------------------------------------------
 // agent.run.started — create run span (child of issue span when available)
@@ -65,6 +101,11 @@ export async function handleRunStartedTraces(
   let parentCtx = resolvedIssueId
     ? resolveParentContext(ctx, resolvedIssueId)
     : undefined;
+
+  // Fallback: use W3C Trace Context from the event envelope
+  if (!parentCtx) {
+    parentCtx = extractTraceContext(event);
+  }
 
   // Fallback: restore from plugin state if not in memory
   if (!parentCtx && resolvedIssueId) {
@@ -285,6 +326,11 @@ export async function handleCostTraces(
   let parentCtx = parentSpan
     ? trace.setSpan(context.active(), parentSpan)
     : undefined;
+
+  // Fallback: use W3C Trace Context from the event envelope
+  if (!parentCtx) {
+    parentCtx = extractTraceContext(event);
+  }
 
   // Fallback: restore parent context from plugin state if not in memory
   if (!parentCtx && heartbeatRunId) {

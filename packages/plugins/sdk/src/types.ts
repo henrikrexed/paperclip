@@ -143,6 +143,21 @@ export interface PluginEvent<TPayload = unknown> {
   companyId: string;
   /** Typed event payload. */
   payload: TPayload;
+  /**
+   * Optional W3C Trace Context propagation headers.
+   *
+   * When present, event handlers can use these fields to link child spans
+   * to the trace that was active when the event was emitted, instead of
+   * starting a new disconnected trace.
+   *
+   * @see https://www.w3.org/TR/trace-context/
+   */
+  traceContext?: {
+    /** W3C `traceparent` header value (e.g. `"00-<traceId>-<spanId>-01"`). */
+    traceparent: string;
+    /** Optional W3C `tracestate` header value. */
+    tracestate?: string;
+  };
 }
 
 // ---------------------------------------------------------------------------

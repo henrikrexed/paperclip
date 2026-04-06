@@ -24,6 +24,19 @@ import type { PluginEventType } from "@paperclipai/shared";
 import type { PluginEvent, EventFilter } from "@paperclipai/plugin-sdk";
 
 // ---------------------------------------------------------------------------
+// Trace context provider type
+// ---------------------------------------------------------------------------
+
+/**
+ * A callback that returns the active W3C Trace Context headers, if any.
+ *
+ * Registered by instrumentation plugins (e.g. the observability plugin) so
+ * the event bus can propagate trace context on every emitted event without
+ * the server itself depending on `@opentelemetry/api`.
+ */
+export type TraceContextProvider = () => { traceparent: string; tracestate?: string } | undefined;
+
+// ---------------------------------------------------------------------------
 // Internal types
 // ---------------------------------------------------------------------------
 
@@ -150,6 +163,9 @@ export function createPluginEventBus(): PluginEventBus {
   // Subscription registry: pluginKey → list of subscriptions
   const registry = new Map<string, Subscription[]>();
 
+  // Optional trace context provider — set by instrumentation plugins
+  let _traceContextProvider: TraceContextProvider | null = null;
+
   /**
    * Retrieve or create the subscription list for a plugin.
    */
@@ -170,6 +186,14 @@ export function createPluginEventBus(): PluginEventBus {
    * single misbehaving plugin cannot interrupt delivery to other plugins.
    */
   async function emit(event: PluginEvent): Promise<PluginEventBusEmitResult> {
+    // Inject W3C Trace Context if not already present on the event
+    if (!event.traceContext && _traceContextProvider) {
+      const ctx = _traceContextProvider();
+      if (ctx) {
+        event.traceContext = ctx;
+      }
+    }
+
     const errors: Array<{ pluginId: string; error: unknown }> = [];
     const promises: Promise<void>[] = [];
 
@@ -298,6 +322,15 @@ export function createPluginEventBus(): PluginEventBus {
       for (const subs of registry.values()) total += subs.length;
       return total;
     },
+    /**
+     * Register a callback that supplies the active W3C Trace Context.
+     *
+     * Called once during emit — if the event already carries `traceContext`,
+     * the provider is skipped. Pass `null` to clear a previously set provider.
+     */
+    setTraceContextProvider(provider: TraceContextProvider | null): void {
+      _traceContextProvider = provider;
+    },
   };
 }
 
@@ -347,6 +380,15 @@ export interface PluginEventBus {
    * specific plugin if `pluginId` is provided.
    */
   subscriptionCount(pluginId?: string): number;
+
+  /**
+   * Register a provider that returns the active W3C Trace Context headers.
+   *
+   * Instrumentation plugins (e.g. observability) call this during setup so
+   * the bus can propagate trace context on emitted events without the server
+   * itself depending on `@opentelemetry/api`.
+   */
+  setTraceContextProvider(provider: TraceContextProvider | null): void;
 }
 
 /**
