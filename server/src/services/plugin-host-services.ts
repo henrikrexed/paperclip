@@ -570,6 +570,15 @@ export function buildHostServices(
           scopedBus.subscribe(params.eventPattern as any, handler);
         }
       },
+      async pushTraceContext(params: { key: string; traceparent: string; tracestate?: string }) {
+        eventBus.pushTraceContext(params.key, {
+          traceparent: params.traceparent,
+          tracestate: params.tracestate,
+        });
+      },
+      async clearTraceContext(params: { key: string }) {
+        eventBus.clearTraceContext(params.key);
+      },
     },
 
     http: {

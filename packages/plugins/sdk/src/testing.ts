@@ -181,6 +181,14 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
         requireCapability(manifest, capabilitySet, "events.emit");
         await harness.emit(`plugin.${manifest.id}.${name}`, payload, { companyId });
       },
+      async pushTraceContext(_key: string, _ctx: { traceparent: string; tracestate?: string }) {
+        requireCapability(manifest, capabilitySet, "events.subscribe");
+        // no-op in test harness
+      },
+      async clearTraceContext(_key: string) {
+        requireCapability(manifest, capabilitySet, "events.subscribe");
+        // no-op in test harness
+      },
     },
     jobs: {
       register(key, fn) {

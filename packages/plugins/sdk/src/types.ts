@@ -381,6 +381,26 @@ export interface PluginEventsClient {
    * @param payload - JSON-serializable event payload
    */
   emit(name: string, companyId: string, payload: unknown): Promise<void>;
+
+  /**
+   * Store a W3C Trace Context for a domain key so the event bus can inject
+   * it into subsequent server-emitted events for the same run or issue.
+   *
+   * Instrumentation plugins call this after creating spans. The key should
+   * follow the convention `"run:<runId>"` or `"issue:<issueId>"`.
+   *
+   * Requires the `events.subscribe` capability.
+   */
+  pushTraceContext(key: string, ctx: { traceparent: string; tracestate?: string }): Promise<void>;
+
+  /**
+   * Remove a previously stored trace context for a domain key.
+   *
+   * Called when a span ends to prevent stale contexts from being injected.
+   *
+   * Requires the `events.subscribe` capability.
+   */
+  clearTraceContext(key: string): Promise<void>;
 }
 
 /**

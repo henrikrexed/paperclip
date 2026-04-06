@@ -55,6 +55,17 @@ export interface TelemetryContext {
 
   /** issueId → { projectId, identifier, title } (refreshed by collect-metrics job). */
   issueContextMap: Map<string, { projectId: string; identifier: string; title: string }>;
+
+  /**
+   * Push a W3C trace context to the event bus for automatic injection into
+   * subsequent server-emitted events for the same run or issue.
+   */
+  pushTraceContext(key: string, ctx: { traceparent: string; tracestate?: string }): void;
+
+  /**
+   * Clear a previously pushed trace context from the event bus.
+   */
+  clearTraceContext(key: string): void;
 }
 
 // ---------------------------------------------------------------------------

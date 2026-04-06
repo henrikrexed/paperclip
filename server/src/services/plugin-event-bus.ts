@@ -166,6 +166,10 @@ export function createPluginEventBus(): PluginEventBus {
   // Optional trace context provider — set by instrumentation plugins
   let _traceContextProvider: TraceContextProvider | null = null;
 
+  // Stored trace contexts pushed by instrumentation plugins, keyed by
+  // domain key (e.g. "run:<runId>", "issue:<issueId>").
+  const _traceContextMap = new Map<string, { traceparent: string; tracestate?: string }>();
+
   /**
    * Retrieve or create the subscription list for a plugin.
    */
@@ -191,6 +195,25 @@ export function createPluginEventBus(): PluginEventBus {
       const ctx = _traceContextProvider();
       if (ctx) {
         event.traceContext = ctx;
+      }
+    }
+
+    // Fallback: inject from stored trace context map (pushed by plugins)
+    if (!event.traceContext && _traceContextMap.size > 0) {
+      const payload = event.payload as Record<string, unknown> | null;
+      // Check run-scoped keys (heartbeatRunId takes priority, then runId)
+      const runId = payload?.heartbeatRunId ?? payload?.runId;
+      if (typeof runId === "string") {
+        const stored = _traceContextMap.get(`run:${runId}`);
+        if (stored) event.traceContext = stored;
+      }
+      // Check issue-scoped keys
+      if (!event.traceContext) {
+        const issueId = payload?.issueId ?? payload?.id;
+        if (typeof issueId === "string") {
+          const stored = _traceContextMap.get(`issue:${issueId}`);
+          if (stored) event.traceContext = stored;
+        }
       }
     }
 
@@ -331,6 +354,29 @@ export function createPluginEventBus(): PluginEventBus {
     setTraceContextProvider(provider: TraceContextProvider | null): void {
       _traceContextProvider = provider;
     },
+    /**
+     * Store a W3C Trace Context for a domain key (e.g. `"run:<runId>"`).
+     *
+     * During `emit()`, the bus looks up stored contexts by inspecting the
+     * event payload for `heartbeatRunId`, `runId`, or `issueId` fields and
+     * injects the matching trace context into the event envelope.
+     *
+     * Instrumentation plugins call this after creating spans so that
+     * subsequent server-emitted events for the same run/issue carry the
+     * correct W3C trace context without the server depending on OTel.
+     */
+    pushTraceContext(key: string, ctx: { traceparent: string; tracestate?: string }): void {
+      _traceContextMap.set(key, ctx);
+    },
+    /**
+     * Remove a previously stored trace context for a domain key.
+     *
+     * Called by instrumentation plugins when a span ends (run finished,
+     * issue done) to prevent stale contexts from being injected.
+     */
+    clearTraceContext(key: string): void {
+      _traceContextMap.delete(key);
+    },
   };
 }
 
@@ -389,6 +435,18 @@ export interface PluginEventBus {
    * itself depending on `@opentelemetry/api`.
    */
   setTraceContextProvider(provider: TraceContextProvider | null): void;
+
+  /**
+   * Store a W3C Trace Context for a domain key.
+   *
+   * @see {@link createPluginEventBus} for auto-injection logic.
+   */
+  pushTraceContext(key: string, ctx: { traceparent: string; tracestate?: string }): void;
+
+  /**
+   * Remove a previously stored trace context for a domain key.
+   */
+  clearTraceContext(key: string): void;
 }
 
 /**

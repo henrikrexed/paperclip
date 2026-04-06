@@ -219,6 +219,8 @@ export function createTestTelemetryCtx(overrides: Partial<TelemetryContext> = {}
       projectNameMap: new Map<string, string>(),
       agentIssueMap: new Map<string, { issueId: string; issueIdentifier: string; projectId: string }>(),
       issueContextMap: new Map<string, { projectId: string; identifier: string; title: string }>(),
+      pushTraceContext: vi.fn(),
+      clearTraceContext: vi.fn(),
       ...overrides,
     } as TelemetryContext,
     meter,

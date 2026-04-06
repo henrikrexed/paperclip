@@ -488,6 +488,14 @@ export interface WorkerToHostMethods {
     params: { eventPattern: string; filter?: Record<string, unknown> | null },
     result: void,
   ];
+  "events.pushTraceContext": [
+    params: { key: string; traceparent: string; tracestate?: string },
+    result: void,
+  ];
+  "events.clearTraceContext": [
+    params: { key: string },
+    result: void,
+  ];
 
   // HTTP
   "http.fetch": [

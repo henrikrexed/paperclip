@@ -145,6 +145,15 @@ interface IssueSnapshot {
 }
 let issueSnapshots: IssueSnapshot[] = [];
 
+interface AgentIssueAssignmentSnapshot {
+  agentId: string;
+  agentName: string;
+  companyId: string;
+  status: string;
+  count: number;
+}
+let agentIssueAssignmentSnapshots: AgentIssueAssignmentSnapshot[] = [];
+
 interface GovernanceSnapshot {
   companyId: string;
   approvalsPending: number;
@@ -313,6 +322,12 @@ const plugin: PaperclipPlugin = definePlugin({
           projectNameMap,
           agentIssueMap,
           issueContextMap,
+          pushTraceContext(key: string, traceCtx: { traceparent: string; tracestate?: string }) {
+            void pluginCtx.events.pushTraceContext(key, traceCtx).catch(() => {});
+          },
+          clearTraceContext(key: string) {
+            void pluginCtx.events.clearTraceContext(key).catch(() => {});
+          },
         }
       : null;
 
@@ -432,6 +447,37 @@ const plugin: PaperclipPlugin = definePlugin({
           project_name: snap.projectName,
           company_id: snap.companyId,
         });
+      }
+    });
+
+    const agentIssuesAssignedGauge = otel.meter.createObservableGauge(
+      METRIC_NAMES.agentIssuesAssigned,
+      { description: "Number of issues assigned per agent by status" },
+    );
+    agentIssuesAssignedGauge.addCallback((obs) => {
+      for (const snap of agentIssueAssignmentSnapshots) {
+        obs.observe(snap.count, {
+          agent_id: snap.agentId,
+          agent_name: snap.agentName,
+          status: snap.status,
+          company_id: snap.companyId,
+        });
+      }
+    });
+
+    const agentsRunningGauge = otel.meter.createObservableGauge(
+      METRIC_NAMES.agentsRunning,
+      { description: "Count of currently running agents" },
+    );
+    agentsRunningGauge.addCallback((obs) => {
+      for (const snap of agentSnapshots) {
+        if (snap.status === "running") {
+          obs.observe(1, {
+            agent_id: snap.agentId,
+            agent_name: snap.agentName,
+            company_id: snap.companyId,
+          });
+        }
       }
     });
 
@@ -614,6 +660,44 @@ const plugin: PaperclipPlugin = definePlugin({
         issueSnapshots = Array.from(issueBuckets.values());
         ctx.logger.info("Issue count snapshots updated", {
           buckets: issueSnapshots.length,
+        });
+
+        // --- Collect issue assignments per agent ---
+
+        const agentIssueBuckets = new Map<string, AgentIssueAssignmentSnapshot>();
+
+        for (const company of companies) {
+          const issues = await ctx.issues.list({
+            companyId: company.id,
+            limit: 200,
+            offset: 0,
+          });
+
+          for (const issue of issues as Issue[]) {
+            const assigneeId = (issue as unknown as Record<string, unknown>).assigneeAgentId as string | null;
+            if (!assigneeId) continue;
+
+            const agentSnap = snapshots.find((s) => s.agentId === assigneeId);
+            const agentName = agentSnap?.agentName ?? "unknown";
+            const key = `${assigneeId}:${issue.status}`;
+            const existing = agentIssueBuckets.get(key);
+            if (existing) {
+              existing.count++;
+            } else {
+              agentIssueBuckets.set(key, {
+                agentId: assigneeId,
+                agentName,
+                companyId: company.id,
+                status: issue.status,
+                count: 1,
+              });
+            }
+          }
+        }
+
+        agentIssueAssignmentSnapshots = Array.from(agentIssueBuckets.values());
+        ctx.logger.info("Agent issue assignment snapshots updated", {
+          buckets: agentIssueAssignmentSnapshots.length,
         });
 
         // --- Collect governance & budget gauges ---

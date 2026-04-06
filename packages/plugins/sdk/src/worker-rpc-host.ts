@@ -402,6 +402,14 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
         async emit(name: string, companyId: string, payload: unknown): Promise<void> {
           await callHost("events.emit", { name, companyId, payload });
         },
+
+        async pushTraceContext(key: string, ctx: { traceparent: string; tracestate?: string }): Promise<void> {
+          await callHost("events.pushTraceContext", { key, traceparent: ctx.traceparent, tracestate: ctx.tracestate });
+        },
+
+        async clearTraceContext(key: string): Promise<void> {
+          await callHost("events.clearTraceContext", { key });
+        },
       },
 
       jobs: {

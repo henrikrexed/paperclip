@@ -103,10 +103,12 @@ export interface HostServices {
     list(params: WorkerToHostMethods["entities.list"][0]): Promise<WorkerToHostMethods["entities.list"][1]>;
   };
 
-  /** Provides `events.emit` and `events.subscribe`. */
+  /** Provides `events.emit`, `events.subscribe`, and trace context propagation. */
   events: {
     emit(params: WorkerToHostMethods["events.emit"][0]): Promise<void>;
     subscribe(params: WorkerToHostMethods["events.subscribe"][0]): Promise<void>;
+    pushTraceContext(params: WorkerToHostMethods["events.pushTraceContext"][0]): Promise<void>;
+    clearTraceContext(params: WorkerToHostMethods["events.clearTraceContext"][0]): Promise<void>;
   };
 
   /** Provides `http.fetch`. */
@@ -271,6 +273,8 @@ const METHOD_CAPABILITY_MAP: Record<WorkerToHostMethodName, PluginCapability | n
   // Events
   "events.emit": "events.emit",
   "events.subscribe": "events.subscribe",
+  "events.pushTraceContext": "events.subscribe",
+  "events.clearTraceContext": "events.subscribe",
 
   // HTTP
   "http.fetch": "http.outbound",
@@ -425,6 +429,12 @@ export function createHostClientHandlers(
     }),
     "events.subscribe": gated("events.subscribe", async (params) => {
       return services.events.subscribe(params);
+    }),
+    "events.pushTraceContext": gated("events.pushTraceContext", async (params) => {
+      return services.events.pushTraceContext(params);
+    }),
+    "events.clearTraceContext": gated("events.clearTraceContext", async (params) => {
+      return services.events.clearTraceContext(params);
     }),
 
     // HTTP

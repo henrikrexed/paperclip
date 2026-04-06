@@ -142,13 +142,21 @@ export async function handleRunStartedTraces(
   if (runId) {
     ctx.activeRunSpans.set(runId, span);
 
+    // Push trace context to event bus so subsequent server-emitted events
+    // (e.g. cost_event.created) carry the correct W3C trace context.
+    const sc = span.spanContext();
+    const flags = sc.traceFlags.toString(16).padStart(2, "0");
+    ctx.pushTraceContext(`run:${runId}`, {
+      traceparent: `00-${sc.traceId}-${sc.spanId}-${flags}`,
+    });
+
     await ctx.state
       .set(
         { scopeKind: "instance", stateKey: `span:run:${runId}` },
         {
-          traceId: span.spanContext().traceId,
-          spanId: span.spanContext().spanId,
-          traceFlags: span.spanContext().traceFlags,
+          traceId: sc.traceId,
+          spanId: sc.spanId,
+          traceFlags: sc.traceFlags,
           startTime: Date.now(),
         },
       )
@@ -200,6 +208,7 @@ export async function handleRunFinishedTraces(
     ctx.activeRunSpans.delete(runId);
   }
 
+  ctx.clearTraceContext(`run:${runId}`);
   await ctx.state
     .delete({ scopeKind: "instance", stateKey: `span:run:${runId}` })
     .catch(() => {});
@@ -236,6 +245,7 @@ export async function handleRunFailedTraces(
     ctx.activeRunSpans.delete(runId);
   }
 
+  ctx.clearTraceContext(`run:${runId}`);
   await ctx.state
     .delete({ scopeKind: "instance", stateKey: `span:run:${runId}` })
     .catch(() => {});
@@ -261,6 +271,7 @@ export async function handleRunCancelledTraces(
     ctx.activeRunSpans.delete(runId);
   }
 
+  ctx.clearTraceContext(`run:${runId}`);
   await ctx.state
     .delete({ scopeKind: "instance", stateKey: `span:run:${runId}` })
     .catch(() => {});
@@ -427,13 +438,20 @@ export async function handleIssueUpdatedTraces(
 
     ctx.activeIssueSpans.set(issueId, span);
 
+    // Push trace context to event bus for issue-scoped events
+    const sc = span.spanContext();
+    const flags = sc.traceFlags.toString(16).padStart(2, "0");
+    ctx.pushTraceContext(`issue:${issueId}`, {
+      traceparent: `00-${sc.traceId}-${sc.spanId}-${flags}`,
+    });
+
     await ctx.state
       .set(
         { scopeKind: "issue", scopeId: issueId, stateKey: "execution-span" },
         {
-          traceId: span.spanContext().traceId,
-          spanId: span.spanContext().spanId,
-          traceFlags: span.spanContext().traceFlags,
+          traceId: sc.traceId,
+          spanId: sc.spanId,
+          traceFlags: sc.traceFlags,
           startTime: Date.now(),
         },
       )
@@ -505,6 +523,7 @@ export async function handleIssueUpdatedTraces(
       ctx.activeIssueSpans.delete(issueId);
     }
 
+    ctx.clearTraceContext(`issue:${issueId}`);
     await ctx.state
       .delete({
         scopeKind: "issue",
