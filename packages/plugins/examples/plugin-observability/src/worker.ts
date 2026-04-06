@@ -15,6 +15,7 @@ import {
   type PluginHealthDiagnostics,
   type PluginJobContext,
 } from "@paperclipai/plugin-sdk";
+import { SpanStatusCode, type Span } from "@opentelemetry/api";
 import type { ObservabilityConfig } from "./constants.js";
 import { DEFAULT_CONFIG, JOB_KEYS } from "./constants.js";
 import { initOTel, type OTelHandle } from "./otel.js";
@@ -28,6 +29,9 @@ let ctx: PluginContext | null = null;
 let startedAt: string | null = null;
 let eventsProcessed = 0;
 let lastError: string | null = null;
+
+/** In-memory map of active run spans keyed by runId. */
+const activeRunSpans = new Map<string, Span>();
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -82,22 +86,28 @@ async function handleAgentRunStarted(event: PluginEvent<unknown>): Promise<void>
     },
   });
 
-  // Store span context in plugin state so we can correlate on run.finished/failed
+  // Store span in-memory so we can end it on run.finished/failed with correct duration
   const runId = String(p.runId ?? "");
-  if (runId && ctx) {
-    await ctx.state
-      .set(
-        { scopeKind: "instance", stateKey: `span:run:${runId}` },
-        {
-          traceId: span.spanContext().traceId,
-          spanId: span.spanContext().spanId,
-          startTime: Date.now(),
-        },
-      )
-      .catch(() => {});
-  }
+  if (runId) {
+    activeRunSpans.set(runId, span);
 
-  span.end();
+    // Also persist trace context in plugin state for cross-process correlation
+    if (ctx) {
+      await ctx.state
+        .set(
+          { scopeKind: "instance", stateKey: `span:run:${runId}` },
+          {
+            traceId: span.spanContext().traceId,
+            spanId: span.spanContext().spanId,
+            startTime: Date.now(),
+          },
+        )
+        .catch(() => {});
+    }
+  } else {
+    // No runId to correlate — end immediately as a point-in-time event
+    span.end();
+  }
 }
 
 async function handleAgentRunFinished(event: PluginEvent<unknown>): Promise<void> {
@@ -120,11 +130,21 @@ async function handleAgentRunFinished(event: PluginEvent<unknown>): Promise<void
     });
   }
 
-  // Clean up span state
-  if (runId && ctx) {
-    await ctx.state
-      .delete({ scopeKind: "instance", stateKey: `span:run:${runId}` })
-      .catch(() => {});
+  // End the run span with success status
+  if (runId) {
+    const span = activeRunSpans.get(runId);
+    if (span) {
+      span.setStatus({ code: SpanStatusCode.OK });
+      span.end();
+      activeRunSpans.delete(runId);
+    }
+
+    // Clean up persisted span state
+    if (ctx) {
+      await ctx.state
+        .delete({ scopeKind: "instance", stateKey: `span:run:${runId}` })
+        .catch(() => {});
+    }
   }
 }
 
@@ -143,10 +163,24 @@ async function handleAgentRunFailed(event: PluginEvent<unknown>): Promise<void> 
     error: String(p.error ?? "unknown"),
   });
 
-  if (runId && ctx) {
-    await ctx.state
-      .delete({ scopeKind: "instance", stateKey: `span:run:${runId}` })
-      .catch(() => {});
+  // End the run span with error status
+  if (runId) {
+    const span = activeRunSpans.get(runId);
+    if (span) {
+      span.setStatus({
+        code: SpanStatusCode.ERROR,
+        message: String(p.error ?? "unknown"),
+      });
+      span.end();
+      activeRunSpans.delete(runId);
+    }
+
+    // Clean up persisted span state
+    if (ctx) {
+      await ctx.state
+        .delete({ scopeKind: "instance", stateKey: `span:run:${runId}` })
+        .catch(() => {});
+    }
   }
 }
 
@@ -237,6 +271,74 @@ async function handleGenericEvent(event: PluginEvent<unknown>): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
+// Data handlers for UI bridge
+// ---------------------------------------------------------------------------
+
+function registerDataHandlers(pluginCtx: PluginContext): void {
+  // Dashboard-level health overview
+  pluginCtx.data.register("health-overview", async (params) => {
+    const companyId = typeof params.companyId === "string" ? params.companyId : "";
+    const agents = companyId
+      ? await pluginCtx.agents.list({ companyId, limit: 200, offset: 0 })
+      : [];
+
+    const agentSummaries = agents.map((a) => ({
+      id: a.id,
+      name: a.name,
+      status: a.status,
+      lastHeartbeatAt: a.lastHeartbeatAt ? String(a.lastHeartbeatAt) : null,
+      budgetMonthlyCents: a.budgetMonthlyCents,
+      spentMonthlyCents: a.spentMonthlyCents,
+    }));
+
+    return {
+      otelInitialised: otel !== null,
+      startedAt,
+      eventsProcessed,
+      lastError,
+      agentCount: agents.length,
+      agents: agentSummaries,
+    };
+  });
+
+  // Per-agent health detail for agent detail tab
+  pluginCtx.data.register("agent-health", async (params) => {
+    const companyId = typeof params.companyId === "string" ? params.companyId : "";
+    const agentId = typeof params.agentId === "string" ? params.agentId : "";
+
+    if (!companyId || !agentId) {
+      return { error: "Missing companyId or agentId" };
+    }
+
+    const agents = await pluginCtx.agents.list({ companyId, limit: 200, offset: 0 });
+    const agent = agents.find((a) => a.id === agentId);
+
+    if (!agent) {
+      return { error: "Agent not found" };
+    }
+
+    const budgetPct = agent.budgetMonthlyCents > 0
+      ? Math.round((agent.spentMonthlyCents / agent.budgetMonthlyCents) * 100)
+      : 0;
+
+    return {
+      id: agent.id,
+      name: agent.name,
+      status: agent.status,
+      role: agent.role,
+      title: agent.title ?? "",
+      lastHeartbeatAt: agent.lastHeartbeatAt ? String(agent.lastHeartbeatAt) : null,
+      budgetMonthlyCents: agent.budgetMonthlyCents,
+      spentMonthlyCents: agent.spentMonthlyCents,
+      budgetPct,
+      otelStatus: otel ? "connected" : lastError ? "degraded" : "disconnected",
+      eventsProcessed,
+      pluginStartedAt: startedAt,
+    };
+  });
+}
+
+// ---------------------------------------------------------------------------
 // Plugin definition
 // ---------------------------------------------------------------------------
 
@@ -299,6 +401,11 @@ const plugin: PaperclipPlugin = definePlugin({
         message: `OTel metrics flush — ${eventsProcessed} events processed since startup`,
       });
     });
+
+    // -----------------------------------------------------------------------
+    // Register data handlers for UI bridge
+    // -----------------------------------------------------------------------
+    registerDataHandlers(pluginCtx);
 
     await ctx.activity.log({
       companyId: "",
