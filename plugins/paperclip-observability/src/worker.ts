@@ -122,6 +122,8 @@ const projectNameMap = new Map<string, string>();
 const agentIssueMap = new Map<string, { issueId: string; issueIdentifier: string; projectId: string }>();
 // issueId → { projectId, identifier, title } (refreshed by collect-metrics job)
 const issueContextMap = new Map<string, { projectId: string; identifier: string; title: string }>();
+// agentId → display name (refreshed by collect-metrics job)
+const agentNameMap = new Map<string, string>();
 
 // Gauge snapshot data — written by the collect-metrics job, read by observable gauge callbacks
 interface AgentSnapshot {
@@ -317,11 +319,14 @@ const plugin: PaperclipPlugin = definePlugin({
           activeSessionSpans,
           getTracerForAgent(agentId: string, agentName: string) {
             if (!agentId || !otel) return otel!.tracer;
-            return otel!.agentTracers.getTracer(agentId, agentName);
+            // Resolve display name from agentNameMap if the passed name looks like a key
+            const resolvedName = agentNameMap.get(agentId) || agentName;
+            return otel!.agentTracers.getTracer(agentId, resolvedName);
           },
           projectNameMap,
           agentIssueMap,
           issueContextMap,
+          agentNameMap,
           pushTraceContext(key: string, traceCtx: { traceparent: string; tracestate?: string }) {
             void pluginCtx.events.pushTraceContext(key, traceCtx).catch(() => {});
           },
@@ -603,6 +608,10 @@ const plugin: PaperclipPlugin = definePlugin({
         }
 
         agentSnapshots = snapshots;
+        // Refresh agentId → displayName lookup for trace handlers
+        for (const snap of snapshots) {
+          agentNameMap.set(snap.agentId, snap.agentName);
+        }
         ctx.logger.info("Agent health snapshots updated", {
           agentCount: snapshots.length,
           companyCount: companies.length,

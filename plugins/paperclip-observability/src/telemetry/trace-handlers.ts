@@ -66,7 +66,8 @@ export async function handleRunStartedTraces(
   const issueId = String(p.issueId ?? "");
 
   const agentId = String(p.agentId ?? "");
-  const agentName = String(p.agentName ?? "");
+  // Resolve display name: prefer agentNameMap lookup, fall back to payload
+  const agentName = (agentId && ctx.agentNameMap.get(agentId)) || String(p.agentName ?? "");
 
   // Resolve business context from agentIssueMap (primary) or issueContextMap (fallback)
   const agentIssue = ctx.agentIssueMap.get(agentId);
@@ -287,7 +288,7 @@ export async function handleCostTraces(
 ): Promise<void> {
   const p = event.payload as Record<string, unknown>;
   const agentId = String(p.agentId ?? "");
-  const agentName = String(p.agentName ?? "");
+  const agentName = (agentId && ctx.agentNameMap.get(agentId)) || String(p.agentName ?? "");
   const provider = mapProvider(String(p.provider ?? ""));
   const model = String(p.model ?? "unknown");
   const spanName = `chat ${model}`;
@@ -393,10 +394,13 @@ export async function handleIssueUpdatedTraces(
 ): Promise<void> {
   const p = event.payload as Record<string, unknown>;
   const status = String(p.status ?? "unknown");
-  const previousStatus = String(p.previousStatus ?? "");
-  const issueId = String(p.id ?? "");
+  const prev = p._previous as Record<string, unknown> | undefined;
+  const previousStatus = String(p.previousStatus ?? prev?.status ?? "");
+  const issueId = String(p.id ?? event.entityId ?? "");
   const assigneeAgentId = String(p.assigneeAgentId ?? "");
-  const assigneeAgentName = String(p.assigneeAgentName ?? p.executionAgentNameKey ?? "");
+  // Resolve display name: prefer agentNameMap lookup, fall back to payload fields
+  const assigneeAgentName = (assigneeAgentId && ctx.agentNameMap.get(assigneeAgentId))
+    || String(p.assigneeAgentName ?? p.executionAgentNameKey ?? "");
 
   // Use per-agent tracer when an assignee is known
   const tracer = assigneeAgentId

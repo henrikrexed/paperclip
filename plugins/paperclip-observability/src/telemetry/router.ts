@@ -56,6 +56,9 @@ export interface TelemetryContext {
   /** issueId → { projectId, identifier, title } (refreshed by collect-metrics job). */
   issueContextMap: Map<string, { projectId: string; identifier: string; title: string }>;
 
+  /** agentId → display name (refreshed by collect-metrics job). */
+  agentNameMap: Map<string, string>;
+
   /**
    * Push a W3C trace context to the event bus for automatic injection into
    * subsequent server-emitted events for the same run or issue.
