@@ -368,7 +368,12 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
 
       config: {
         async get() {
-          return callHost("config.get", {} as Record<string, never>);
+          // Return the locally cached config instead of making a host RPC call.
+          // The config is set during initialize (params.config) and kept in sync
+          // by handleConfigChanged when the host pushes updates. This avoids a
+          // worker→host round-trip during setup() which can deadlock when the
+          // host's config handler is not yet ready (e.g. during startup).
+          return currentConfig;
         },
       },
 

@@ -1462,8 +1462,31 @@ export function pluginLoader(
 
       log.info("plugin-loader: loading all ready plugins");
 
-      // Fetch all plugins in ready status, ordered by installOrder
+      // Fetch plugins in ready status, plus any in error status that should be
+      // retried on server restart.  Previous activation failures (e.g. startup
+      // races) should not permanently prevent a plugin from loading.
       const readyPlugins = (await registry.listByStatus("ready")) as PluginRecord[];
+      const errorPlugins = (await registry.listByStatus("error")) as PluginRecord[];
+
+      if (errorPlugins.length > 0) {
+        log.info(
+          { count: errorPlugins.length },
+          "plugin-loader: retrying plugins in error status on startup",
+        );
+        // Reset error plugins to ready before attempting activation so
+        // activatePlugin does not skip them.
+        for (const ep of errorPlugins) {
+          try {
+            await registry.updateStatus(ep.id, { status: "ready", lastError: null });
+          } catch (err) {
+            log.warn(
+              { pluginId: ep.id, err: err instanceof Error ? err.message : String(err) },
+              "plugin-loader: failed to reset error plugin status",
+            );
+          }
+        }
+        readyPlugins.push(...errorPlugins);
+      }
 
       if (readyPlugins.length === 0) {
         log.info("plugin-loader: no ready plugins to load");
