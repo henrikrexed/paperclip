@@ -1474,18 +1474,21 @@ export function pluginLoader(
           "plugin-loader: retrying plugins in error status on startup",
         );
         // Reset error plugins to ready before attempting activation so
-        // activatePlugin does not skip them.
+        // activatePlugin does not skip them.  Only enqueue plugins whose
+        // status was successfully reset.
+        const resetOk: PluginRecord[] = [];
         for (const ep of errorPlugins) {
           try {
             await registry.updateStatus(ep.id, { status: "ready", lastError: null });
+            resetOk.push(ep);
           } catch (err) {
             log.warn(
               { pluginId: ep.id, err: err instanceof Error ? err.message : String(err) },
-              "plugin-loader: failed to reset error plugin status",
+              "plugin-loader: failed to reset error plugin status — skipping retry",
             );
           }
         }
-        readyPlugins.push(...errorPlugins);
+        readyPlugins.push(...resetOk);
       }
 
       if (readyPlugins.length === 0) {
@@ -1866,8 +1869,8 @@ export function pluginLoader(
         "plugin-loader: failed to activate plugin",
       );
 
-      // Mark the plugin as errored in the database so it is not retried
-      // automatically on next startup without operator intervention.
+      // Mark the plugin as errored in the database.  It will be retried
+      // automatically on next server restart (see loadAll error-plugin recovery).
       try {
         await lifecycleManager.markError(pluginId, `Activation failed: ${errorMessage}`);
       } catch (markErr) {
