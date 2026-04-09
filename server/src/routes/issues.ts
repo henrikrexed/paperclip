@@ -987,6 +987,35 @@ export function issueRoutes(db: Db, storage: StorageService) {
       details: { title: issue.title, identifier: issue.identifier },
     });
 
+    // Emit agent.delegation.created when an agent run creates a subtask assigned to another agent
+    if (
+      actor.agentId &&
+      actor.runId &&
+      issue.assigneeAgentId &&
+      issue.assigneeAgentId !== actor.agentId &&
+      issue.parentId
+    ) {
+      await logActivity(db, {
+        companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        action: "agent.delegation.created",
+        entityType: "issue",
+        entityId: issue.id,
+        details: {
+          delegatingAgentId: actor.agentId,
+          delegatingRunId: actor.runId,
+          delegatedAgentId: issue.assigneeAgentId,
+          issueId: issue.id,
+          subtaskId: issue.id,
+          reason: "subtask_creation",
+          identifier: issue.identifier,
+        },
+      });
+    }
+
     void queueIssueAssignmentWakeup({
       heartbeat,
       issue,
@@ -1147,6 +1176,34 @@ export function issueRoutes(db: Db, storage: StorageService) {
         _previous: hasFieldChanges ? previous : undefined,
       },
     });
+
+    // Emit agent.delegation.created when an agent run reassigns to another agent
+    if (
+      assigneeWillChange &&
+      actor.agentId &&
+      actor.runId &&
+      issue.assigneeAgentId &&
+      issue.assigneeAgentId !== actor.agentId
+    ) {
+      await logActivity(db, {
+        companyId: issue.companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        action: "agent.delegation.created",
+        entityType: "issue",
+        entityId: issue.id,
+        details: {
+          delegatingAgentId: actor.agentId,
+          delegatingRunId: actor.runId,
+          delegatedAgentId: issue.assigneeAgentId,
+          issueId: issue.id,
+          reason: "assignee_change",
+          identifier: issue.identifier,
+        },
+      });
+    }
 
     let comment = null;
     if (commentBody) {
