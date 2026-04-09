@@ -62,4 +62,8 @@ export const METRIC_NAMES = {
 
   // Comment metrics
   issueCommentsCreated: "paperclip.issue.comments.created",
+
+  // Database instrumentation metrics
+  dbQueryDuration: "paperclip.db.query.duration_ms",
+  dbQueryErrors: "paperclip.db.query.errors",
 } as const;
