@@ -25,6 +25,7 @@ import type { AdapterExecutionResult, AdapterInvocationMeta, AdapterSessionCodec
 import { createLocalAgentJwt } from "../agent-auth-jwt.js";
 import { parseObject, asBoolean, asNumber, appendWithCap, MAX_EXCERPT_BYTES } from "../adapters/utils.js";
 import { logActivity } from "./activity-log.js";
+import { withHeartbeatSpan } from "./trace-context.js";
 import { costService } from "./costs.js";
 import { companySkillService } from "./company-skills.js";
 import { budgetService, type BudgetEnforcementScope } from "./budgets.js";
@@ -70,6 +71,11 @@ const startLocksByAgent = new Map<string, Promise<void>>();
 const REPO_ONLY_CWD_SENTINEL = "/__paperclip_repo_only__";
 const MANAGED_WORKSPACE_GIT_CLONE_TIMEOUT_MS = 10 * 60 * 1000;
 const execFile = promisify(execFileCallback);
+// HTTP-based adapters that do not spawn child processes and should not be reaped by orphan detection
+const HTTP_BASED_ADAPTERS = new Set([
+  "ollama_agent",
+]);
+
 const SESSIONED_LOCAL_ADAPTERS = new Set([
   "claude_local",
   "codex_local",
@@ -1916,6 +1922,9 @@ export function heartbeatService(db: Db) {
     for (const { run, adapterType } of activeRuns) {
       if (runningProcesses.has(run.id) || activeRunExecutions.has(run.id)) continue;
 
+      // Skip HTTP-based adapters (no child process to track)
+      if (HTTP_BASED_ADAPTERS.has(adapterType)) continue;
+
       // Apply staleness threshold to avoid false positives
       if (staleThresholdMs > 0) {
         const refTime = run.updatedAt ? new Date(run.updatedAt).getTime() : 0;
@@ -2116,6 +2125,14 @@ export function heartbeatService(db: Db) {
 
     activeRunExecutions.add(run.id);
 
+    await withHeartbeatSpan(
+      run.id,
+      run.agentId,
+      {
+        "paperclip.company.id": run.companyId,
+        "paperclip.run.invocation_source": run.invocationSource ?? "",
+      },
+      async () => {
     try {
     const agent = await getAgent(run.agentId);
     if (!agent) {
@@ -3011,6 +3028,7 @@ export function heartbeatService(db: Db) {
           activeRunExecutions.delete(run.id);
           await startNextQueuedRunForAgent(run.agentId);
         }
+    }); // end withHeartbeatSpan
   }
 
   async function releaseIssueExecutionAndPromote(run: typeof heartbeatRuns.$inferSelect) {
