@@ -23,6 +23,7 @@ import {
 } from "@paperclipai/db";
 import { extractAgentMentionIds, extractProjectMentionIds } from "@paperclipai/shared";
 import { conflict, notFound, unprocessable } from "../errors.js";
+import { instrumentQuery } from "./db-instrumentation.js";
 import {
   defaultIssueExecutionWorkspaceSettingsForProject,
   gateProjectExecutionWorkspacePolicy,
@@ -1048,7 +1049,10 @@ export function issueService(db: Db) {
           values.cancelledAt = new Date();
         }
 
-        const [issue] = await tx.insert(issues).values(values).returning();
+        const [issue] = await instrumentQuery(
+          { operation: "insert", table: "issues", description: "issue create", companyId },
+          () => tx.insert(issues).values(values).returning(),
+        );
         if (inputLabelIds) {
           await syncIssueLabels(issue.id, companyId, inputLabelIds, tx);
         }
@@ -1147,12 +1151,15 @@ export function issueService(db: Db) {
           projectGoalId: nextProjectGoalId,
           defaultGoalId: defaultCompanyGoal?.id ?? null,
         });
-        const updated = await tx
-          .update(issues)
-          .set(patch)
-          .where(eq(issues.id, id))
-          .returning()
-          .then((rows) => rows[0] ?? null);
+        const updated = await instrumentQuery(
+          { operation: "update", table: "issues", description: "issue update", companyId: existing.companyId },
+          () => tx
+            .update(issues)
+            .set(patch)
+            .where(eq(issues.id, id))
+            .returning()
+            .then((rows) => rows[0] ?? null),
+        );
         if (!updated) return null;
         if (nextLabelIds !== undefined) {
           await syncIssueLabels(updated.id, existing.companyId, nextLabelIds, tx);
@@ -1215,27 +1222,30 @@ export function issueService(db: Db) {
       const executionLockCondition = checkoutRunId
         ? or(isNull(issues.executionRunId), eq(issues.executionRunId, checkoutRunId))
         : isNull(issues.executionRunId);
-      const updated = await db
-        .update(issues)
-        .set({
-          assigneeAgentId: agentId,
-          assigneeUserId: null,
-          checkoutRunId,
-          executionRunId: checkoutRunId,
-          status: "in_progress",
-          startedAt: now,
-          updatedAt: now,
-        })
-        .where(
-          and(
-            eq(issues.id, id),
-            inArray(issues.status, expectedStatuses),
-            or(isNull(issues.assigneeAgentId), sameRunAssigneeCondition),
-            executionLockCondition,
-          ),
-        )
-        .returning()
-        .then((rows) => rows[0] ?? null);
+      const updated = await instrumentQuery(
+        { operation: "update", table: "issues", description: "issue checkout", agentId, runId: checkoutRunId ?? undefined },
+        () => db
+          .update(issues)
+          .set({
+            assigneeAgentId: agentId,
+            assigneeUserId: null,
+            checkoutRunId,
+            executionRunId: checkoutRunId,
+            status: "in_progress",
+            startedAt: now,
+            updatedAt: now,
+          })
+          .where(
+            and(
+              eq(issues.id, id),
+              inArray(issues.status, expectedStatuses),
+              or(isNull(issues.assigneeAgentId), sameRunAssigneeCondition),
+              executionLockCondition,
+            ),
+          )
+          .returning()
+          .then((rows) => rows[0] ?? null),
+      );
 
       if (updated) {
         const [enriched] = await withIssueLabels(db, [updated]);

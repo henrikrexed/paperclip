@@ -86,6 +86,12 @@ import {
   handleActivityLogs,
 } from "./telemetry/activity-handlers.js";
 
+// DB query handlers
+import {
+  handleDbQueryTraces,
+  handleDbQueryMetrics,
+} from "./telemetry/db-query-handlers.js";
+
 // Session handlers
 import {
   handleSessionCreatedTraces,
@@ -270,6 +276,10 @@ function createRouter(): EventTelemetryRouter {
   router.register("agent.session.error", handleSessionErrorMetrics);
   router.register("agent.session.error", handleSessionErrorLogs);
 
+  // db.query.completed
+  router.register("db.query.completed", handleDbQueryTraces);
+  router.register("db.query.completed", handleDbQueryMetrics);
+
   return router;
 }
 
@@ -352,6 +362,8 @@ const plugin: PaperclipPlugin = definePlugin({
       "agent.session.status",
       "agent.session.done",
       "agent.session.error",
+      // Database instrumentation
+      "db.query.completed",
     ] as const;
 
     for (const eventType of eventTypes) {

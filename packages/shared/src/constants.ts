@@ -687,6 +687,7 @@ export const PLUGIN_EVENT_TYPES = [
   "agent.session.done",
   "agent.session.error",
   "agent.delegation.created",
+  "db.query.completed",
 ] as const;
 export type PluginEventType = (typeof PLUGIN_EVENT_TYPES)[number];
 
