@@ -77,8 +77,8 @@ describe("handleActivityMetrics", () => {
 // ---------------------------------------------------------------------------
 
 describe("handleActivityTraces", () => {
-  it("adds span event to active run span when present", async () => {
-    const { ctx } = createTestTelemetryCtx();
+  it("creates child span for tool activity under active run span", async () => {
+    const { ctx, tracer } = createTestTelemetryCtx();
     const runSpan = createMockSpan();
     ctx.activeRunSpans.set("run-1", runSpan);
 
@@ -94,21 +94,24 @@ describe("handleActivityTraces", () => {
       ctx,
     );
 
-    expect(runSpan._events).toHaveLength(1);
-    expect(runSpan._events[0].name).toBe("activity.logged");
-    expect(runSpan._events[0].attributes).toMatchObject({
+    // Tool activities now create child spans, not span events
+    expect(runSpan._events).toHaveLength(0);
+    expect(tracer._lastSpan).toBeDefined();
+    expect(tracer._lastSpan!._attributes).toMatchObject({
+      "gen_ai.tool.name": "file.file.edit",
+      "gen_ai.operation.name": "tool_call",
       "paperclip.activity.action": "file.edit",
       "paperclip.activity.entity_type": "file",
       "paperclip.activity.entity_id": "src/main.ts",
       "paperclip.agent.id": "agent-1",
       "paperclip.company.id": "co-1",
+      "gen_ai.tool.call.id": "src/main.ts",
     });
-    // Should NOT create a standalone span — just a span event
-    expect(runSpan._ended).toBe(false);
+    expect(tracer._lastSpan!._ended).toBe(true);
   });
 
-  it("attaches gen_ai.tool.name for tool entity types", async () => {
-    const { ctx } = createTestTelemetryCtx();
+  it("attaches gen_ai.tool.name for tool entity types as child span", async () => {
+    const { ctx, tracer } = createTestTelemetryCtx();
     const runSpan = createMockSpan();
     ctx.activeRunSpans.set("run-1", runSpan);
 
@@ -122,11 +125,12 @@ describe("handleActivityTraces", () => {
       ctx,
     );
 
-    expect(runSpan._events[0].attributes!["gen_ai.tool.name"]).toBe("read");
+    expect(tracer._lastSpan!._attributes["gen_ai.tool.name"]).toBe("read");
+    expect(tracer._lastSpan!._ended).toBe(true);
   });
 
-  it("attaches gen_ai.tool.name for file entity types", async () => {
-    const { ctx } = createTestTelemetryCtx();
+  it("attaches gen_ai.tool.name for file entity types as child span", async () => {
+    const { ctx, tracer } = createTestTelemetryCtx();
     const runSpan = createMockSpan();
     ctx.activeRunSpans.set("run-1", runSpan);
 
@@ -139,7 +143,8 @@ describe("handleActivityTraces", () => {
       ctx,
     );
 
-    expect(runSpan._events[0].attributes!["gen_ai.tool.name"]).toBe("file.write");
+    expect(tracer._lastSpan!._attributes["gen_ai.tool.name"]).toBe("file.write");
+    expect(tracer._lastSpan!._ended).toBe(true);
   });
 
   it("creates standalone span when no active run span exists", async () => {
@@ -266,27 +271,29 @@ describe("handleActivityLogs", () => {
 
 describe("resolveToolName mapping", () => {
   it("strips tool. prefix from actions on tool entities", async () => {
-    const { ctx } = createTestTelemetryCtx();
-    const span = createMockSpan();
-    ctx.activeRunSpans.set("r", span);
+    const { ctx, tracer } = createTestTelemetryCtx();
+    const runSpan = createMockSpan();
+    ctx.activeRunSpans.set("r", runSpan);
 
     await handleActivityTraces(
       makeEvent("activity.logged", { runId: "r", action: "tool.bash", entityType: "tool" }),
       ctx,
     );
-    expect(span._events[0].attributes!["gen_ai.tool.name"]).toBe("bash");
+    expect(tracer._lastSpan!._attributes["gen_ai.tool.name"]).toBe("bash");
+    expect(tracer._lastSpan!._ended).toBe(true);
   });
 
   it("maps api_call entity type to entityType.action format", async () => {
-    const { ctx } = createTestTelemetryCtx();
-    const span = createMockSpan();
-    ctx.activeRunSpans.set("r", span);
+    const { ctx, tracer } = createTestTelemetryCtx();
+    const runSpan = createMockSpan();
+    ctx.activeRunSpans.set("r", runSpan);
 
     await handleActivityTraces(
       makeEvent("activity.logged", { runId: "r", action: "fetch", entityType: "api_call" }),
       ctx,
     );
-    expect(span._events[0].attributes!["gen_ai.tool.name"]).toBe("api_call.fetch");
+    expect(tracer._lastSpan!._attributes["gen_ai.tool.name"]).toBe("api_call.fetch");
+    expect(tracer._lastSpan!._ended).toBe(true);
   });
 
   it("returns null for unknown entity types", async () => {
