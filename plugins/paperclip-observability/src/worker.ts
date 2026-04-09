@@ -608,11 +608,13 @@ const plugin: PaperclipPlugin = definePlugin({
             }
 
             // Build issue context map for cost attribution and delegation linking
+            // The Issue SDK type does not expose parentId, but the API always returns it.
+            const issueWithParent = issue as Issue & { parentId?: string };
             issueContextMap.set(issue.id, {
               projectId,
               identifier: issue.identifier ?? "",
               title: issue.title ?? "",
-              parentId: (issue as unknown as Record<string, unknown>).parentId as string | undefined,
+              parentId: issueWithParent.parentId,
             });
           }
         }

@@ -51,8 +51,10 @@ export interface TelemetryContext {
   activeSessionSpans: Map<string, Span>;
 
   /**
-   * Get a per-agent tracer with service.name = paperclip.agent.<agentName>.
-   * Falls back to the default tracer if agentId/agentName are empty.
+   * Get a tracer for the given agent. Currently returns the shared default
+   * tracer for all agents; agent identity is captured via span attributes
+   * (`paperclip.agent.id`, `gen_ai.agent.name`) rather than separate
+   * service.name values.
    */
   getTracerForAgent(agentId: string, agentName: string): Tracer;
 

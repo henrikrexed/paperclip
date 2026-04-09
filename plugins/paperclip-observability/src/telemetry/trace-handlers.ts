@@ -17,6 +17,12 @@ import type { TelemetryContext } from "./router.js";
 import { mapProvider } from "../provider-map.js";
 import { METRIC_NAMES } from "../constants.js";
 
+// Debounce for fallback API lookups during cold starts (issue #5 from review).
+// Prevents repeated companies.list + issues.list calls when multiple runs
+// start before agentIssueMap is populated.
+let lastFallbackLookupMs = 0;
+const FALLBACK_LOOKUP_DEBOUNCE_MS = 10_000; // 10 seconds
+
 // ---------------------------------------------------------------------------
 // agent.run.started — create run span (child of issue span when available)
 // ---------------------------------------------------------------------------
@@ -44,7 +50,10 @@ export async function handleRunStartedTraces(
   // Fallback: when agentIssueMap is empty (issue was already in_progress before
   // this run started), query the agent's assigned issue to populate context.
   // The agent.run.started event may not include companyId, so look it up first.
-  if (!agentIssue) {
+  // Debounced to avoid repeated API calls during cold starts with multiple runs.
+  const now = Date.now();
+  if (!agentIssue && now - lastFallbackLookupMs >= FALLBACK_LOOKUP_DEBOUNCE_MS) {
+    lastFallbackLookupMs = now;
     try {
       let companyId = event.companyId || "";
       if (!companyId) {
@@ -279,10 +288,6 @@ async function checkDelegationSource(
 }
 
 /**
- * Store the completed run's span context as a delegation source so that
- * the next agent run on this issue becomes a child span.
- */
-/**
  * Clean up the agent → run mapping when a run ends.
  */
 function cleanupAgentRunMapping(
@@ -358,6 +363,11 @@ export async function handleRunFinishedTraces(
     span.end();
     ctx.activeRunSpans.delete(runId);
 
+    // Clean up persisted span state to prevent accumulation
+    await ctx.state
+      .delete({ scopeKind: "instance", stateKey: `span:run:${runId}` })
+      .catch(() => {});
+
     // Store delegation source for cross-agent trace linking
     const sc = span.spanContext();
     await storeDelegationSource(ctx, issueId, agentId, runId, sc.traceId, sc.spanId, sc.traceFlags);
@@ -400,6 +410,11 @@ export async function handleRunFailedTraces(
     span.end();
     ctx.activeRunSpans.delete(runId);
 
+    // Clean up persisted span state to prevent accumulation
+    await ctx.state
+      .delete({ scopeKind: "instance", stateKey: `span:run:${runId}` })
+      .catch(() => {});
+
     // Store delegation source for cross-agent trace linking
     const sc = span.spanContext();
     await storeDelegationSource(ctx, issueId, agentId, runId, sc.traceId, sc.spanId, sc.traceFlags);
@@ -430,6 +445,11 @@ export async function handleRunCancelledTraces(
     span.setAttribute("paperclip.run.cancelled", true);
     span.end();
     ctx.activeRunSpans.delete(runId);
+
+    // Clean up persisted span state to prevent accumulation
+    await ctx.state
+      .delete({ scopeKind: "instance", stateKey: `span:run:${runId}` })
+      .catch(() => {});
 
     // Store delegation source for cross-agent trace linking
     const sc = span.spanContext();
