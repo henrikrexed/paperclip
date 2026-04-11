@@ -115,29 +115,12 @@ export async function handleRunStartedTraces(
   // Use per-agent tracer so this agent gets its own service.name
   const tracer = ctx.getTracerForAgent(agentId, agentName);
 
-  // --- Server-propagated trace context (highest priority) ---
-  // When the server sends traceContext in the event payload, it means the
-  // server had an active OTel span (e.g. heartbeat dispatch). Parent our
-  // run span under it for true distributed tracing.
+  // --- Issue execution span context (highest priority for run spans) ---
+  // Run spans should be children of the issue execution span to form
+  // issue-centric trace trees visible in the trace backend UI.
   let parentCtx: ReturnType<typeof context.active> | undefined = undefined;
 
-  parentCtx = parentCtxFromServerTrace(event);
-  if (parentCtx) {
-    spanAttrs["paperclip.trace.server_propagated"] = true;
-  }
-
-  // --- Cross-agent delegation linking ---
-  // Check if a prior agent run delegated work to this agent on this issue
-  // (or on a parent issue for subtask delegation).
-  if (!parentCtx && resolvedIssueId && agentId) {
-    parentCtx = await resolveDelegationParent(ctx, resolvedIssueId, agentId);
-    if (parentCtx) {
-      spanAttrs["paperclip.delegation.linked"] = true;
-    }
-  }
-
-  // Fall back to issue execution span for same-trace context
-  if (!parentCtx && resolvedIssueId) {
+  if (resolvedIssueId) {
     parentCtx = resolveParentContext(ctx, resolvedIssueId);
 
     // Fallback: restore from plugin state
@@ -164,8 +147,11 @@ export async function handleRunStartedTraces(
     // Last resort: create the issue span now if it was never created
     // (e.g. issue was already in_progress before this plugin instance started)
     if (!parentCtx && issueIdentifier) {
-      const issueSpan = tracer.startSpan("paperclip.issue.execution", {
-        kind: SpanKind.INTERNAL,
+      // Use server-propagated trace context as parent so the issue execution
+      // span is not orphaned in the trace backend.
+      const serverCtx = parentCtxFromServerTrace(event);
+      const issueSpanOpts = {
+        kind: SpanKind.INTERNAL as const,
         attributes: {
           "paperclip.issue.id": resolvedIssueId,
           "paperclip.issue.identifier": issueIdentifier,
@@ -175,10 +161,32 @@ export async function handleRunStartedTraces(
           "gen_ai.agent.id": agentId,
           "gen_ai.agent.name": agentName,
         },
-      });
-      ctx.activeIssueSpans.set(resolvedIssueId, issueSpan);
+      };
+      const issueSpan = serverCtx
+        ? tracer.startSpan("paperclip.issue.execution", issueSpanOpts, serverCtx)
+        : tracer.startSpan("paperclip.issue.execution", issueSpanOpts);
       parentCtx = trace.setSpan(context.active(), issueSpan);
+      // End immediately — child spans link via traceId/spanId, not live object
+      issueSpan.end();
+      // Persist for future child span linking
+      await ctx.state
+        .set(
+          { scopeKind: "issue", scopeId: resolvedIssueId, stateKey: "execution-span" },
+          {
+            traceId: issueSpan.spanContext().traceId,
+            spanId: issueSpan.spanContext().spanId,
+            traceFlags: issueSpan.spanContext().traceFlags,
+            startTime: Date.now(),
+          },
+        )
+        .catch(() => {});
     }
+  }
+
+  // Fallback: use server-propagated trace context so the run span is not
+  // orphaned when no issue context is available.
+  if (!parentCtx) {
+    parentCtx = parentCtxFromServerTrace(event);
   }
 
   const span = parentCtx
@@ -562,18 +570,53 @@ export async function handleCostTraces(
     }
   }
 
+  // Fallback: link to the agent's issue execution span when the run span
+  // has already been ended and cleaned up (late-arriving cost events).
+  if (!parentCtx && costIssueId) {
+    const issueSpan = ctx.activeIssueSpans.get(costIssueId);
+    if (issueSpan) {
+      parentCtx = trace.setSpan(context.active(), issueSpan);
+    } else {
+      const stored = await ctx.state
+        .get({ scopeKind: "issue", scopeId: costIssueId, stateKey: "execution-span" })
+        .catch(() => null);
+      if (
+        stored &&
+        typeof stored === "object" &&
+        "traceId" in (stored as Record<string, unknown>) &&
+        "spanId" in (stored as Record<string, unknown>)
+      ) {
+        const s = stored as { traceId: string; spanId: string; traceFlags: number };
+        parentCtx = trace.setSpanContext(context.active(), {
+          traceId: s.traceId,
+          spanId: s.spanId,
+          traceFlags: s.traceFlags ?? 1,
+          isRemote: true,
+        });
+      }
+    }
+  }
+
+  // Estimate LLM call duration from output tokens.
+  // Typical throughput ~50 tokens/sec for large models, minimum 500ms.
+  const outputTokens = Number(p.outputTokens ?? 0);
+  const estimatedDurationMs = Math.max(500, Math.round((outputTokens / 50) * 1000));
+  const endTimeMs = Date.now();
+  const startTimeMs = endTimeMs - estimatedDurationMs;
+
   const span = parentCtx
     ? tracer.startSpan(
         spanName,
-        { kind: SpanKind.CLIENT, attributes: llmSpanAttrs },
+        { kind: SpanKind.CLIENT, attributes: llmSpanAttrs, startTime: startTimeMs },
         parentCtx,
       )
     : tracer.startSpan(spanName, {
         kind: SpanKind.CLIENT,
         attributes: llmSpanAttrs,
+        startTime: startTimeMs,
       });
 
-  span.end();
+  span.end(endTimeMs);
 }
 
 // ---------------------------------------------------------------------------
@@ -673,9 +716,11 @@ export async function handleIssueCreatedTraces(
         attributes: spanAttrs,
       });
 
-  ctx.activeIssueSpans.set(issueId, span);
+  // End immediately so the span is exported right away. Child spans
+  // (execution, runs) link via persisted traceId/spanId, not the live object.
+  span.end();
 
-  // Persist span context for cross-restart resilience
+  // Persist span context for child span linking
   await ctx.state
     .set(
       { scopeKind: "issue", scopeId: issueId, stateKey: "execution-span" },
@@ -771,6 +816,12 @@ export async function handleIssueUpdatedTraces(
       existingSpan.end();
     }
 
+    // Fallback: use server-propagated trace context so the execution span
+    // is not orphaned when the plugin missed the original issue.created event.
+    if (!executionParentCtx) {
+      executionParentCtx = parentCtxFromServerTrace(event);
+    }
+
     const span = executionParentCtx
       ? tracer.startSpan(
           "paperclip.issue.execution",
@@ -818,7 +869,15 @@ export async function handleIssueUpdatedTraces(
       });
     }
 
-    ctx.activeIssueSpans.set(issueId, span);
+    // End the execution span immediately so it appears in the trace backend
+    // right away. Child spans (runs, costs) will link to this span via the
+    // persisted traceId/spanId in plugin state — they don't need the span
+    // object to be open. This avoids long-lived spans that never get exported
+    // by the BatchSpanProcessor.
+    span.end();
+
+    // Do NOT store in activeIssueSpans — the span is already ended.
+    // The done/cancelled handler will clean up persisted state instead.
 
     await ctx.state
       .set(
