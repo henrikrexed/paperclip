@@ -22,6 +22,7 @@ import { METRIC_NAMES } from "../constants.js";
 // Prevents repeated companies.list + issues.list calls when multiple runs
 // start before agentIssueMap is populated.
 let lastFallbackLookupMs = 0;
+let lastCostFallbackLookupMs = 0;
 const FALLBACK_LOOKUP_DEBOUNCE_MS = 10_000; // 10 seconds
 
 // ---------------------------------------------------------------------------
@@ -93,6 +94,10 @@ export async function handleRunStartedTraces(
   // Track agent → runId mapping for delegation detection
   if (agentId && runId) {
     ctx.agentActiveRunId.set(agentId, runId);
+  }
+  // Cache agent name for cost spans that may arrive with empty agentName
+  if (agentId && agentName) {
+    ctx.agentNameMap.set(agentId, agentName);
   }
 
   const spanAttrs: Record<string, string | number | boolean> = {
@@ -231,6 +236,41 @@ function resolveParentContext(
   return issueSpan
     ? trace.setSpan(context.active(), issueSpan)
     : undefined;
+}
+
+/**
+ * Resolve parent context from persisted execution-span state (plugin state),
+ * falling back to server-propagated trace context. Used when the execution
+ * span was ended immediately and is not in activeIssueSpans.
+ */
+async function resolvePersistedParentCtx(
+  ctx: TelemetryContext,
+  issueId: string,
+  event: PluginEvent,
+) {
+  // Try server-propagated trace context first
+  const serverCtx = parentCtxFromServerTrace(event);
+  if (serverCtx) return serverCtx;
+
+  // Fall back to persisted execution-span context
+  const stored = await ctx.state
+    .get({ scopeKind: "issue", scopeId: issueId, stateKey: "execution-span" })
+    .catch(() => null);
+  if (
+    stored &&
+    typeof stored === "object" &&
+    "traceId" in (stored as Record<string, unknown>) &&
+    "spanId" in (stored as Record<string, unknown>)
+  ) {
+    const s = stored as { traceId: string; spanId: string; traceFlags: number };
+    return trace.setSpanContext(context.active(), {
+      traceId: s.traceId,
+      spanId: s.spanId,
+      traceFlags: s.traceFlags ?? 1,
+      isRemote: true,
+    });
+  }
+  return undefined;
 }
 
 // ---------------------------------------------------------------------------
@@ -488,7 +528,8 @@ export async function handleCostTraces(
 ): Promise<void> {
   const p = event.payload as Record<string, unknown>;
   const agentId = String(p.agentId ?? "");
-  const agentName = String(p.agentName ?? "");
+  // Resolve agent name from payload, falling back to the cached agentNameMap
+  const agentName = String(p.agentName ?? "") || ctx.agentNameMap.get(agentId) || "";
   const provider = mapProvider(String(p.provider ?? ""));
   const model = String(p.model ?? "unknown");
   const spanName = `chat ${model}`;
@@ -497,7 +538,42 @@ export async function handleCostTraces(
   const tracer = ctx.getTracerForAgent(agentId, agentName);
 
   // Resolve business context from agent's active issue
-  const agentIssue = ctx.agentIssueMap.get(agentId);
+  let agentIssue = ctx.agentIssueMap.get(agentId);
+
+  // Fallback: when agentIssueMap is empty (e.g. after plugin restart or missed
+  // issue.updated event), query the API for the agent's active issue.
+  const now = Date.now();
+  if (!agentIssue && agentId && now - lastCostFallbackLookupMs >= FALLBACK_LOOKUP_DEBOUNCE_MS) {
+    lastCostFallbackLookupMs = now;
+    try {
+      let companyId = event.companyId || "";
+      if (!companyId) {
+        const companies = await ctx.companies.list({ limit: 1, offset: 0 });
+        if (companies.length > 0) companyId = companies[0].id;
+      }
+      if (companyId) {
+        const issues = await ctx.issues.list({
+          companyId,
+          assigneeAgentId: agentId,
+          status: "in_progress",
+          limit: 1,
+          offset: 0,
+        });
+        if (issues.length > 0) {
+          const assigned = issues[0];
+          agentIssue = {
+            issueId: assigned.id,
+            issueIdentifier: assigned.identifier || "",
+            projectId: assigned.projectId || "",
+          };
+          ctx.agentIssueMap.set(agentId, agentIssue);
+        }
+      }
+    } catch {
+      // Best-effort: continue without issue context
+    }
+  }
+
   const costIssueId = agentIssue?.issueId || "";
   const costIssueCtx = costIssueId ? ctx.issueContextMap.get(costIssueId) : undefined;
   const costIssueIdentifier = agentIssue?.issueIdentifier || costIssueCtx?.identifier || "";
@@ -732,6 +808,40 @@ export async function handleIssueCreatedTraces(
       },
     )
     .catch(() => {});
+
+  // --- Create run-child span so issue creation appears under the heartbeat run ---
+  if (createdByAgentId) {
+    const creatorRunId = ctx.agentActiveRunId.get(createdByAgentId);
+    if (creatorRunId) {
+      const creatorRunSpan = ctx.activeRunSpans.get(creatorRunId);
+      if (creatorRunSpan) {
+        const creatorAgentName = ctx.agentNameMap.get(createdByAgentId) || "";
+        const runParentCtx = trace.setSpan(context.active(), creatorRunSpan);
+        const runChildTracer = ctx.getTracerForAgent(createdByAgentId, creatorAgentName);
+        const runChildSpan = runChildTracer.startSpan(
+          "paperclip.issue.created",
+          {
+            kind: SpanKind.INTERNAL,
+            attributes: {
+              "paperclip.issue.id": issueId,
+              "paperclip.issue.identifier": identifier,
+              "paperclip.issue.title": title,
+              "paperclip.issue.priority": priority,
+              "paperclip.issue.parent_id": parentId,
+              "paperclip.issue.assignee_agent_id": assigneeAgentId,
+              "paperclip.issue.assignee_agent_name": assigneeAgentName,
+              "paperclip.agent.id": createdByAgentId,
+              "paperclip.agent.name": creatorAgentName,
+              "paperclip.project.id": projectId,
+              "paperclip.project.name": projectName,
+            },
+          },
+          runParentCtx,
+        );
+        runChildSpan.end();
+      }
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -748,10 +858,18 @@ export async function handleIssueCommentCreatedTraces(
 
   const commentId = String(p.id ?? p.commentId ?? "");
   const authorAgentId = String(p.authorAgentId ?? "");
-  const authorAgentName = String(p.authorAgentName ?? "");
+  const authorAgentName = String(p.authorAgentName ?? "") || ctx.agentNameMap.get(authorAgentId) || "";
   const authorUserId = String(p.authorUserId ?? "");
 
-  // Find the active issue span to add the comment as a span event
+  const spanEventAttrs = {
+    "paperclip.comment.id": commentId,
+    "paperclip.comment.author_agent_id": authorAgentId,
+    "paperclip.comment.author_agent_name": authorAgentName,
+    "paperclip.comment.author_user_id": authorUserId,
+    "paperclip.issue.id": issueId,
+  };
+
+  // Try to add as span event on an active in-memory span
   let issueSpan = ctx.activeIssueSpans.get(issueId);
 
   // Fallback: check active run spans for the authoring agent
@@ -763,14 +881,53 @@ export async function handleIssueCommentCreatedTraces(
   }
 
   if (issueSpan) {
-    issueSpan.addEvent("issue.comment.created", {
-      "paperclip.comment.id": commentId,
-      "paperclip.comment.author_agent_id": authorAgentId,
-      "paperclip.comment.author_agent_name": authorAgentName,
-      "paperclip.comment.author_user_id": authorUserId,
-      "paperclip.issue.id": issueId,
-    });
+    issueSpan.addEvent("issue.comment.created", spanEventAttrs);
+    return;
   }
+
+  // Fallback: the execution span was ended immediately (not in activeIssueSpans).
+  // Create a short-lived child span linked to the persisted execution-span context
+  // so comment activity still appears in the trace tree.
+  let parentCtx = parentCtxFromServerTrace(event);
+
+  if (!parentCtx) {
+    const stored = await ctx.state
+      .get({ scopeKind: "issue", scopeId: issueId, stateKey: "execution-span" })
+      .catch(() => null);
+    if (
+      stored &&
+      typeof stored === "object" &&
+      "traceId" in (stored as Record<string, unknown>) &&
+      "spanId" in (stored as Record<string, unknown>)
+    ) {
+      const s = stored as { traceId: string; spanId: string; traceFlags: number };
+      parentCtx = trace.setSpanContext(context.active(), {
+        traceId: s.traceId,
+        spanId: s.spanId,
+        traceFlags: s.traceFlags ?? 1,
+        isRemote: true,
+      });
+    }
+  }
+
+  if (!parentCtx) return;
+
+  const tracer = authorAgentId
+    ? ctx.getTracerForAgent(authorAgentId, authorAgentName)
+    : ctx.tracer;
+
+  const span = tracer.startSpan(
+    "paperclip.issue.comment",
+    {
+      kind: SpanKind.INTERNAL,
+      attributes: {
+        ...spanEventAttrs,
+        "paperclip.issue.identifier": ctx.issueContextMap.get(issueId)?.identifier || "",
+      },
+    },
+    parentCtx,
+  );
+  span.end();
 }
 
 // ---------------------------------------------------------------------------
@@ -892,39 +1049,64 @@ export async function handleIssueUpdatedTraces(
       .catch(() => {});
   }
 
-  // --- Add span events for all status transitions (checkout, release, blocked, etc.) ---
-  // Placed AFTER execution span creation so the first todo→in_progress transition
-  // is recorded on the newly created execution span rather than being dropped.
+  // --- Add spans for all status transitions (checkout, release, blocked, etc.) ---
+  // Creates a child span under the execution span so transitions appear in the trace
+  // even when the execution span was ended immediately and is not in activeIssueSpans.
   if (previousStatus && status !== previousStatus && issueId) {
+    const transitionAttrs = {
+      "paperclip.issue.id": issueId,
+      "paperclip.issue.identifier": String(p.identifier ?? ""),
+      "paperclip.issue.previous_status": previousStatus,
+      "paperclip.issue.status": status,
+      "paperclip.agent.id": assigneeAgentId,
+      "paperclip.agent.name": assigneeAgentName,
+    };
+
     const issueSpan = ctx.activeIssueSpans.get(issueId);
     if (issueSpan) {
-      issueSpan.addEvent("issue.status_transition", {
-        "paperclip.issue.id": issueId,
-        "paperclip.issue.previous_status": previousStatus,
-        "paperclip.issue.status": status,
-        "paperclip.agent.id": assigneeAgentId,
-        "paperclip.agent.name": assigneeAgentName,
-      });
+      issueSpan.addEvent("issue.status_transition", transitionAttrs);
+    } else {
+      // Create a child span from persisted execution-span context
+      const parentCtx = await resolvePersistedParentCtx(ctx, issueId, event);
+      if (parentCtx) {
+        const span = tracer.startSpan(
+          "paperclip.issue.status_transition",
+          { kind: SpanKind.INTERNAL, attributes: transitionAttrs },
+          parentCtx,
+        );
+        span.end();
+      }
     }
   }
 
-  // --- Add span events for assignee changes (delegation moments) ---
-  // Placed AFTER execution span creation so first-checkout assignee changes
-  // are recorded on the newly created execution span.
+  // --- Add spans for assignee changes (delegation moments) ---
   if (
     assigneeAgentId !== previousAssigneeAgentId &&
     (assigneeAgentId || previousAssigneeAgentId) &&
     issueId
   ) {
+    const delegationAttrs = {
+      "paperclip.issue.id": issueId,
+      "paperclip.issue.identifier": String(p.identifier ?? ""),
+      "paperclip.issue.previous_assignee_agent_id": previousAssigneeAgentId,
+      "paperclip.issue.previous_assignee_agent_name": previousAssigneeAgentName,
+      "paperclip.issue.assignee_agent_id": assigneeAgentId,
+      "paperclip.issue.assignee_agent_name": assigneeAgentName,
+    };
+
     const issueSpan = ctx.activeIssueSpans.get(issueId);
     if (issueSpan) {
-      issueSpan.addEvent("issue.assignee_changed", {
-        "paperclip.issue.id": issueId,
-        "paperclip.issue.previous_assignee_agent_id": previousAssigneeAgentId,
-        "paperclip.issue.previous_assignee_agent_name": previousAssigneeAgentName,
-        "paperclip.issue.assignee_agent_id": assigneeAgentId,
-        "paperclip.issue.assignee_agent_name": assigneeAgentName,
-      });
+      issueSpan.addEvent("issue.assignee_changed", delegationAttrs);
+    } else {
+      const parentCtx = await resolvePersistedParentCtx(ctx, issueId, event);
+      if (parentCtx) {
+        const span = tracer.startSpan(
+          "paperclip.issue.assignee_changed",
+          { kind: SpanKind.INTERNAL, attributes: delegationAttrs },
+          parentCtx,
+        );
+        span.end();
+      }
     }
   }
 
@@ -947,6 +1129,63 @@ export async function handleIssueUpdatedTraces(
           sc.traceId, sc.spanId, sc.traceFlags,
         );
       }
+    }
+  }
+
+  // --- Create run-child spans so ticket changes appear under the heartbeat run ---
+  // This makes the trace tree show: heartbeat.run → issue.status_change / issue.created
+  if (issueId && previousStatus && status !== previousStatus) {
+    // Find the active run that triggered this update
+    let triggerRunSpan: ReturnType<typeof ctx.activeRunSpans.get> | undefined;
+    let triggerAgentId = "";
+    let triggerAgentName = "";
+
+    // Check if the assignee agent has an active run (most common: agent updating its own task)
+    if (assigneeAgentId) {
+      const runId = ctx.agentActiveRunId.get(assigneeAgentId);
+      if (runId) {
+        triggerRunSpan = ctx.activeRunSpans.get(runId);
+        if (triggerRunSpan) {
+          triggerAgentId = assigneeAgentId;
+          triggerAgentName = assigneeAgentName;
+        }
+      }
+    }
+
+    // Fallback: check if the previous assignee triggered this (e.g. reassignment/delegation)
+    if (!triggerRunSpan && previousAssigneeAgentId) {
+      const runId = ctx.agentActiveRunId.get(previousAssigneeAgentId);
+      if (runId) {
+        triggerRunSpan = ctx.activeRunSpans.get(runId);
+        if (triggerRunSpan) {
+          triggerAgentId = previousAssigneeAgentId;
+          triggerAgentName = previousAssigneeAgentName;
+        }
+      }
+    }
+
+    if (triggerRunSpan) {
+      const runParentCtx = trace.setSpan(context.active(), triggerRunSpan);
+      const runChildTracer = triggerAgentId
+        ? ctx.getTracerForAgent(triggerAgentId, triggerAgentName)
+        : ctx.tracer;
+      const runChildSpan = runChildTracer.startSpan(
+        "paperclip.issue.status_change",
+        {
+          kind: SpanKind.INTERNAL,
+          attributes: {
+            "paperclip.issue.id": issueId,
+            "paperclip.issue.identifier": String(p.identifier ?? ""),
+            "paperclip.issue.title": String(p.title ?? ""),
+            "paperclip.issue.previous_status": previousStatus,
+            "paperclip.issue.status": status,
+            "paperclip.agent.id": triggerAgentId,
+            "paperclip.agent.name": triggerAgentName,
+          },
+        },
+        runParentCtx,
+      );
+      runChildSpan.end();
     }
   }
 
