@@ -72,6 +72,9 @@ export interface TelemetryContext {
 
   /** agentId → agentName (refreshed by collect-metrics job, also populated on run.started). */
   agentNameMap: Map<string, string>;
+
+  /** Recently ended run span contexts — keyed by runId, used as fallback for late-arriving cost events. */
+  endedRunSpanContexts: Map<string, { traceId: string; spanId: string; traceFlags: number; endedAt: number }>;
 }
 
 // ---------------------------------------------------------------------------

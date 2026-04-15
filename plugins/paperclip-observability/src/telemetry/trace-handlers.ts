@@ -361,6 +361,17 @@ function cleanupAgentRunMapping(
   }
 }
 
+const ENDED_RUN_CONTEXT_MAX_AGE_MS = 120_000;
+const ENDED_RUN_CONTEXT_MAX_SIZE = 200;
+
+function pruneEndedRunSpanContexts(ctx: TelemetryContext): void {
+  if (ctx.endedRunSpanContexts.size <= ENDED_RUN_CONTEXT_MAX_SIZE) return;
+  const cutoff = Date.now() - ENDED_RUN_CONTEXT_MAX_AGE_MS;
+  for (const [id, entry] of ctx.endedRunSpanContexts) {
+    if (entry.endedAt < cutoff) ctx.endedRunSpanContexts.delete(id);
+  }
+}
+
 /**
  * Store the completed run's span context as a delegation source so that
  * the next agent run on this issue becomes a child span.
@@ -422,13 +433,21 @@ export async function handleRunFinishedTraces(
     span.end();
     ctx.activeRunSpans.delete(runId);
 
-    // Clean up persisted span state to prevent accumulation
+    // Preserve span context for late-arriving cost events, then clean persisted state
+    const sc = span.spanContext();
+    ctx.endedRunSpanContexts.set(runId, {
+      traceId: sc.traceId,
+      spanId: sc.spanId,
+      traceFlags: sc.traceFlags,
+      endedAt: Date.now(),
+    });
+    pruneEndedRunSpanContexts(ctx);
+
     await ctx.state
       .delete({ scopeKind: "instance", stateKey: `span:run:${runId}` })
       .catch(() => {});
 
     // Store delegation source for cross-agent trace linking
-    const sc = span.spanContext();
     await storeDelegationSource(ctx, issueId, agentId, runId, sc.traceId, sc.spanId, sc.traceFlags);
   }
 
@@ -469,13 +488,21 @@ export async function handleRunFailedTraces(
     span.end();
     ctx.activeRunSpans.delete(runId);
 
-    // Clean up persisted span state to prevent accumulation
+    // Preserve span context for late-arriving cost events, then clean persisted state
+    const sc = span.spanContext();
+    ctx.endedRunSpanContexts.set(runId, {
+      traceId: sc.traceId,
+      spanId: sc.spanId,
+      traceFlags: sc.traceFlags,
+      endedAt: Date.now(),
+    });
+    pruneEndedRunSpanContexts(ctx);
+
     await ctx.state
       .delete({ scopeKind: "instance", stateKey: `span:run:${runId}` })
       .catch(() => {});
 
     // Store delegation source for cross-agent trace linking
-    const sc = span.spanContext();
     await storeDelegationSource(ctx, issueId, agentId, runId, sc.traceId, sc.spanId, sc.traceFlags);
   }
 
@@ -505,13 +532,21 @@ export async function handleRunCancelledTraces(
     span.end();
     ctx.activeRunSpans.delete(runId);
 
-    // Clean up persisted span state to prevent accumulation
+    // Preserve span context for late-arriving cost events, then clean persisted state
+    const sc = span.spanContext();
+    ctx.endedRunSpanContexts.set(runId, {
+      traceId: sc.traceId,
+      spanId: sc.spanId,
+      traceFlags: sc.traceFlags,
+      endedAt: Date.now(),
+    });
+    pruneEndedRunSpanContexts(ctx);
+
     await ctx.state
       .delete({ scopeKind: "instance", stateKey: `span:run:${runId}` })
       .catch(() => {});
 
     // Store delegation source for cross-agent trace linking
-    const sc = span.spanContext();
     await storeDelegationSource(ctx, issueId, agentId, runId, sc.traceId, sc.spanId, sc.traceFlags);
   }
 
@@ -615,6 +650,19 @@ export async function handleCostTraces(
   let parentCtx = parentSpan
     ? trace.setSpan(context.active(), parentSpan)
     : undefined;
+
+  // Fallback: use ended run span context (cost events arrive after run.finished)
+  if (!parentCtx && heartbeatRunId) {
+    const ended = ctx.endedRunSpanContexts.get(heartbeatRunId);
+    if (ended) {
+      parentCtx = trace.setSpanContext(context.active(), {
+        traceId: ended.traceId,
+        spanId: ended.spanId,
+        traceFlags: ended.traceFlags,
+        isRemote: true,
+      });
+    }
+  }
 
   // Fallback: use server-propagated trace context
   if (!parentCtx) {

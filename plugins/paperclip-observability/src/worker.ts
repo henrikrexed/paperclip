@@ -123,6 +123,7 @@ const activeRunSpans = new Map<string, Span>();
 const activeIssueSpans = new Map<string, Span>();
 const activeApprovalSpans = new Map<string, Span>();
 const activeSessionSpans = new Map<string, Span>();
+const endedRunSpanContexts = new Map<string, { traceId: string; spanId: string; traceFlags: number; endedAt: number }>();
 
 // Lookup maps — shared across handler modules via TelemetryContext
 // projectId → projectName (refreshed by collect-metrics job)
@@ -340,6 +341,7 @@ const plugin: PaperclipPlugin = definePlugin({
           issueContextMap,
           agentActiveRunId,
           agentNameMap,
+          endedRunSpanContexts,
         }
       : null;
 
@@ -904,6 +906,7 @@ const plugin: PaperclipPlugin = definePlugin({
       ctx?.logger.info("Ended orphaned run span on shutdown", { runId });
     }
     activeRunSpans.clear();
+    endedRunSpanContexts.clear();
 
     // End any active issue lifecycle spans before shutdown
     for (const [issueId, span] of activeIssueSpans) {
