@@ -4,7 +4,7 @@
  * Calls Ollama in a tool-call loop so the model can:
  *   - list / checkout / complete Paperclip tasks
  *   - post comments
- *   - read/write local files
+ *   - read/write local files (opt-in, sandboxed to a workspace directory)
  *
  * Works with any Ollama model that supports tool calling:
  * qwen3, qwen3.5, llama3.3, mistral-nemo, etc.
@@ -24,6 +24,24 @@ const DEFAULT_BASE_URL = "http://localhost:11434";
 const DEFAULT_MODEL = "qwen3.5:35B";
 const DEFAULT_TIMEOUT_SEC = 600;
 const MAX_TOOL_ITERATIONS = 20;
+
+const FILESYSTEM_TOOL_NAMES = new Set(["read_file", "write_file", "list_directory"]);
+
+interface FilesystemSandbox {
+  workspaceDir: string;
+}
+
+function resolveSandboxPath(sandbox: FilesystemSandbox, rawPath: unknown): string {
+  if (typeof rawPath !== "string" || rawPath.length === 0) {
+    throw new Error("Filesystem tool requires a non-empty 'path' argument");
+  }
+  const root = path.resolve(sandbox.workspaceDir);
+  const resolved = path.resolve(root, rawPath);
+  if (resolved !== root && !resolved.startsWith(root + path.sep)) {
+    throw new Error(`Path traversal denied: '${rawPath}' escapes workspace '${root}'`);
+  }
+  return resolved;
+}
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -58,6 +76,7 @@ interface ToolDeps {
   runId: string;
   taskId?: string;
   authToken?: string;
+  filesystem?: FilesystemSandbox;
 }
 
 // ── Config helpers ────────────────────────────────────────────────────────────
@@ -296,16 +315,34 @@ async function dispatchTool(
         return `Comment posted on ${args.taskId as string}.`;
       }
       case "read_file": {
-        const content = await fs.readFile(args.path as string, "utf-8");
+        if (!deps.filesystem) {
+          throw new Error(
+            "Filesystem tools are disabled. Set adapter config { enableFilesystem: true, workspaceDir: '/abs/path' } to enable.",
+          );
+        }
+        const target = resolveSandboxPath(deps.filesystem, args.path);
+        const content = await fs.readFile(target, "utf-8");
         return content;
       }
       case "write_file": {
-        await fs.mkdir(path.dirname(args.path as string), { recursive: true });
-        await fs.writeFile(args.path as string, args.content as string, "utf-8");
-        return `Written: ${args.path as string}`;
+        if (!deps.filesystem) {
+          throw new Error(
+            "Filesystem tools are disabled. Set adapter config { enableFilesystem: true, workspaceDir: '/abs/path' } to enable.",
+          );
+        }
+        const target = resolveSandboxPath(deps.filesystem, args.path);
+        await fs.mkdir(path.dirname(target), { recursive: true });
+        await fs.writeFile(target, args.content as string, "utf-8");
+        return `Written: ${path.relative(deps.filesystem.workspaceDir, target) || "."}`;
       }
       case "list_directory": {
-        const entries = await fs.readdir(args.path as string, { withFileTypes: true });
+        if (!deps.filesystem) {
+          throw new Error(
+            "Filesystem tools are disabled. Set adapter config { enableFilesystem: true, workspaceDir: '/abs/path' } to enable.",
+          );
+        }
+        const target = resolveSandboxPath(deps.filesystem, args.path);
+        const entries = await fs.readdir(target, { withFileTypes: true });
         return entries.map((e) => `${e.isDirectory() ? "d" : "f"} ${e.name}`).join("\n");
       }
       default:
@@ -341,7 +378,7 @@ ${taskBody ? `\n${taskBody}\n` : ""}
 
 1. Use \`paperclip_get_task\` to read full issue details.
 2. Check out the task with \`paperclip_checkout_task\`.
-3. Do the work. Use \`read_file\` / \`write_file\` if you need to read or produce files.
+3. Do the work. If filesystem tools are enabled, \`read_file\` / \`write_file\` / \`list_directory\` only operate inside the configured workspace directory.
 4. When done, call \`paperclip_complete_task\` with a summary of what you did.`;
   }
 
@@ -415,10 +452,36 @@ export const ollamaAdapter: ServerAdapterModule = {
     const useTools = cfgBool(c.useTools, true);
     const extraOptions = cfgObj(c.options);
 
-    await ctx.onLog("stdout", `[ollama] model=${model} base=${baseUrl} timeout=${timeoutSec}s tools=${useTools}\n`);
+    const enableFilesystem = cfgBool(c.enableFilesystem, false);
+    const workspaceDirRaw = cfgStr(c.workspaceDir);
+    let filesystem: FilesystemSandbox | undefined;
+    if (enableFilesystem) {
+      if (!workspaceDirRaw || !path.isAbsolute(workspaceDirRaw)) {
+        await ctx.onLog(
+          "stderr",
+          "[ollama] enableFilesystem is true but workspaceDir is missing or not absolute — filesystem tools disabled\n",
+        );
+      } else {
+        filesystem = { workspaceDir: path.resolve(workspaceDirRaw) };
+      }
+    }
+
+    const activeTools = useTools
+      ? filesystem
+        ? TOOL_SCHEMAS
+        : TOOL_SCHEMAS.filter((t) => !FILESYSTEM_TOOL_NAMES.has(t.function.name))
+      : [];
+
+    await ctx.onLog(
+      "stdout",
+      `[ollama] model=${model} base=${baseUrl} timeout=${timeoutSec}s tools=${useTools} fs=${filesystem ? filesystem.workspaceDir : "off"}\n`,
+    );
 
     const prompt = buildPrompt(ctx, paperclipApiUrl);
-    const messages: OllamaMessage[] = [{ role: "user", content: prompt }];
+    const messages: OllamaMessage[] = [
+      { role: "system", content: prompt },
+      { role: "user", content: "Begin." },
+    ];
 
     const toolDeps: ToolDeps = {
       paperclipApiUrl,
@@ -427,6 +490,7 @@ export const ollamaAdapter: ServerAdapterModule = {
       runId: ctx.runId,
       taskId: cfgStr(ctx.config?.taskId) ?? cfgStr((ctx.context as Record<string, unknown>)?.taskId as unknown),
       authToken: ctx.authToken,
+      filesystem,
     };
 
     let totalInput = 0;
@@ -444,7 +508,7 @@ export const ollamaAdapter: ServerAdapterModule = {
           baseUrl,
           model,
           messages,
-          useTools ? TOOL_SCHEMAS : [],
+          activeTools,
           extraOptions,
           timeoutSec * 1000,
         );
@@ -572,10 +636,12 @@ The model can list/checkout/complete tasks and read/write local files — no ext
 | useTools | boolean | true | Enable tool-call loop |
 | paperclipApiUrl | string | http://127.0.0.1:3100/api | Paperclip API URL |
 | options | object | {} | Extra Ollama options (temperature, num_ctx, etc.) |
+| enableFilesystem | boolean | false | Expose \`read_file\`/\`write_file\`/\`list_directory\` tools |
+| workspaceDir | string | — | Absolute path the filesystem tools are sandboxed to. Required when \`enableFilesystem\` is true. |
 
 ## Available Tools
 - \`paperclip_list_tasks\` / \`paperclip_get_task\` / \`paperclip_checkout_task\`
 - \`paperclip_complete_task\` / \`paperclip_post_comment\`
-- \`read_file\` / \`write_file\` / \`list_directory\`
+- \`read_file\` / \`write_file\` / \`list_directory\` (opt-in via \`enableFilesystem\`, sandboxed to \`workspaceDir\`)
 `,
 };
