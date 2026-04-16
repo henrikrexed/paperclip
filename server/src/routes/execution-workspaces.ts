@@ -37,13 +37,16 @@ export function executionWorkspaceRoutes(db: Db) {
   router.get("/companies/:companyId/execution-workspaces", async (req, res) => {
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
-    const workspaces = await svc.list(companyId, {
+    const filters = {
       projectId: req.query.projectId as string | undefined,
       projectWorkspaceId: req.query.projectWorkspaceId as string | undefined,
       issueId: req.query.issueId as string | undefined,
       status: req.query.status as string | undefined,
       reuseEligible: req.query.reuseEligible === "true",
-    });
+    };
+    const workspaces = req.query.summary === "true"
+      ? await svc.listSummaries(companyId, filters)
+      : await svc.list(companyId, filters);
     res.json(workspaces);
   });
 
