@@ -415,56 +415,54 @@ function appendWakeText(baseText: string, wakeText: string): string {
   return trimmedBase.length > 0 ? `${trimmedBase}\n\n${wakeText}` : wakeText;
 }
 
-function buildStandardPaperclipPayload(
-  ctx: AdapterExecutionContext,
-  wakePayload: WakePayload,
-  paperclipEnv: Record<string, string>,
-  payloadTemplate: Record<string, unknown>,
-): Record<string, unknown> {
-  const templatePaperclip = parseObject(payloadTemplate.paperclip);
-  const workspace = asRecord(ctx.context.paperclipWorkspace);
-  const workspaces = Array.isArray(ctx.context.paperclipWorkspaces)
-    ? ctx.context.paperclipWorkspaces.filter((entry): entry is Record<string, unknown> => Boolean(asRecord(entry)))
-    : [];
-  const configuredWorkspaceRuntime = parseObject(ctx.config.workspaceRuntime);
-  const runtimeServiceIntents = Array.isArray(ctx.context.paperclipRuntimeServiceIntents)
-    ? ctx.context.paperclipRuntimeServiceIntents.filter(
-        (entry): entry is Record<string, unknown> => Boolean(asRecord(entry)),
-      )
-    : [];
+// Mirror of OpenClaw Gateway `AgentParamsSchema` top-level keys
+// (openclaw/src/gateway/protocol/schema/agent.ts:58). The gateway schema is closed
+// (`additionalProperties: false`), so any template key outside this set is rejected
+// at the gateway with `invalid agent params: at root: unexpected property '<key>'`.
+const OPENCLAW_AGENT_PARAMS_ALLOWED_KEYS = new Set([
+  "message",
+  "agentId",
+  "to",
+  "replyTo",
+  "sessionId",
+  "sessionKey",
+  "thinking",
+  "deliver",
+  "attachments",
+  "channel",
+  "replyChannel",
+  "accountId",
+  "replyAccountId",
+  "threadId",
+  "groupId",
+  "groupChannel",
+  "groupSpace",
+  "timeout",
+  "bestEffortDeliver",
+  "lane",
+  "extraSystemPrompt",
+  "inputProvenance",
+  "idempotencyKey",
+  "label",
+  "spawnedBy",
+  // `text` is tolerated here because we extract it into `message` below;
+  // dropping it silently would be a behavior change.
+  "text",
+]);
 
-  const standardPaperclip: Record<string, unknown> = {
-    runId: ctx.runId,
-    companyId: ctx.agent.companyId,
-    agentId: ctx.agent.id,
-    agentName: ctx.agent.name,
-    taskId: wakePayload.taskId,
-    issueId: wakePayload.issueId,
-    issueIds: wakePayload.issueIds,
-    wakeReason: wakePayload.wakeReason,
-    wakeCommentId: wakePayload.wakeCommentId,
-    approvalId: wakePayload.approvalId,
-    approvalStatus: wakePayload.approvalStatus,
-    apiUrl: paperclipEnv.PAPERCLIP_API_URL ?? null,
-  };
-
-  if (workspace) {
-    standardPaperclip.workspace = workspace;
+function sanitizePayloadTemplate(
+  template: Record<string, unknown>,
+): { allowed: Record<string, unknown>; dropped: string[] } {
+  const allowed: Record<string, unknown> = {};
+  const dropped: string[] = [];
+  for (const [key, value] of Object.entries(template)) {
+    if (OPENCLAW_AGENT_PARAMS_ALLOWED_KEYS.has(key)) {
+      allowed[key] = value;
+    } else {
+      dropped.push(key);
+    }
   }
-  if (workspaces.length > 0) {
-    standardPaperclip.workspaces = workspaces;
-  }
-  if (runtimeServiceIntents.length > 0 || Object.keys(configuredWorkspaceRuntime).length > 0) {
-    standardPaperclip.workspaceRuntime = {
-      ...configuredWorkspaceRuntime,
-      ...(runtimeServiceIntents.length > 0 ? { services: runtimeServiceIntents } : {}),
-    };
-  }
-
-  return {
-    ...templatePaperclip,
-    ...standardPaperclip,
-  };
+  return { allowed, dropped };
 }
 
 function normalizeUrl(input: string): URL | null {
@@ -1066,10 +1064,20 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
   const templateMessage = nonEmpty(payloadTemplate.message) ?? nonEmpty(payloadTemplate.text);
   const message = templateMessage ? appendWakeText(templateMessage, wakeText) : wakeText;
-  const paperclipPayload = buildStandardPaperclipPayload(ctx, wakePayload, paperclipEnv, payloadTemplate);
+
+  const { allowed: sanitizedTemplate, dropped: droppedTemplateKeys } =
+    sanitizePayloadTemplate(payloadTemplate);
+  if (droppedTemplateKeys.length > 0) {
+    await ctx.onLog(
+      "stdout",
+      `[openclaw-gateway] dropping non-schema payloadTemplate keys (OpenClaw rejects unknown top-level properties): ${droppedTemplateKeys
+        .sort()
+        .join(", ")}\n`,
+    );
+  }
 
   const agentParams: Record<string, unknown> = {
-    ...payloadTemplate,
+    ...sanitizedTemplate,
     message,
     sessionKey,
     idempotencyKey: ctx.runId,

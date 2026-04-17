@@ -469,6 +469,72 @@ describe("openclaw gateway adapter execute", () => {
     expect(result.errorCode).toBe("openclaw_gateway_url_missing");
   });
 
+  // Regression for ISI-565: OpenClaw Gateway's AgentParamsSchema rejects
+  // unknown top-level properties. Legacy adapter configs (e.g. Alfred's seeded
+  // adapterConfig.payloadTemplate) carry keys like `paperclip`, `workspace`,
+  // and `metadata` that must be stripped before the outbound call.
+  it("drops non-schema payloadTemplate keys (paperclip, workspace, metadata) from outbound agent params", async () => {
+    const gateway = await createMockGatewayServer();
+    const logs: string[] = [];
+
+    try {
+      const result = await execute(
+        buildContext(
+          {
+            url: gateway.url,
+            headers: { "x-openclaw-token": "gateway-token" },
+            payloadTemplate: {
+              // schema-valid keys — must be preserved
+              message: "wake now",
+              agentId: "remote-agent-123",
+              // legacy keys — must be stripped
+              paperclip: { runId: "legacy", companyId: "legacy", agentId: "legacy" },
+              workspace: { cwd: "/legacy" },
+              workspaces: [{ id: "legacy" }],
+              workspaceRuntime: { services: [] },
+              metadata: { team: "platform" },
+            },
+            waitTimeoutMs: 2000,
+          },
+          {
+            onLog: async (_stream, chunk) => {
+              logs.push(chunk);
+            },
+          },
+        ),
+      );
+
+      expect(result.exitCode).toBe(0);
+
+      const payload = gateway.getAgentPayload();
+      expect(payload).toBeTruthy();
+      expect(payload).not.toHaveProperty("paperclip");
+      expect(payload).not.toHaveProperty("workspace");
+      expect(payload).not.toHaveProperty("workspaces");
+      expect(payload).not.toHaveProperty("workspaceRuntime");
+      expect(payload).not.toHaveProperty("metadata");
+
+      // schema-valid fields still flow through
+      expect(payload?.agentId).toBe("remote-agent-123");
+      expect(payload?.idempotencyKey).toBe("run-123");
+      expect(payload?.sessionKey).toBe("paperclip:issue:issue-123");
+      expect(String(payload?.message ?? "")).toContain("wake now");
+
+      // operators get a visible signal to clean up stale adapterConfig entries
+      const droppedLog = logs.find((entry) =>
+        entry.includes("dropping non-schema payloadTemplate keys"),
+      );
+      expect(droppedLog).toBeTruthy();
+      expect(droppedLog).toContain("metadata");
+      expect(droppedLog).toContain("paperclip");
+      expect(droppedLog).toContain("workspace");
+      expect(droppedLog).toContain("workspaceRuntime");
+      expect(droppedLog).toContain("workspaces");
+    } finally {
+      await gateway.close();
+    }
+  });
+
   it("returns adapter-managed runtime services from gateway result meta", async () => {
     const gateway = await createMockGatewayServer({
       waitPayload: {
