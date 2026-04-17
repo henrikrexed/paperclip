@@ -86,6 +86,9 @@ import {
   handleActivityLogs,
 } from "./telemetry/activity-handlers.js";
 
+// Security detection handler (ISI-568: port of openclaw security detections)
+import { handleActivitySecurity } from "./telemetry/security-handlers.js";
+
 // DB query handlers
 import {
   handleDbQueryMetrics,
@@ -255,6 +258,11 @@ function createRouter(): EventTelemetryRouter {
   router.register("activity.logged", handleActivityMetrics);
   router.register("activity.logged", handleActivityTraces);
   router.register("activity.logged", handleActivityLogs);
+  // Security detections run alongside the activity pipeline. They emit a
+  // dedicated paperclip.security.event span and paperclip.security.*
+  // counters whenever a file / exec / text-input activity matches a
+  // threat pattern (ISI-568).
+  router.register("activity.logged", handleActivitySecurity);
 
   // agent.session.created
   router.register("agent.session.created", handleSessionCreatedTraces);
