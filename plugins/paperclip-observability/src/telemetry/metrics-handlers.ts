@@ -185,6 +185,12 @@ export async function handleCostMetrics(
       "gen_ai.token.type": "output",
     });
   }
+  if (p.cachedInputTokens != null) {
+    tokenUsage.record(Number(p.cachedInputTokens), {
+      ...genAIBaseAttrs,
+      "gen_ai.token.type": "cache_read",
+    });
+  }
 }
 
 // ---------------------------------------------------------------------------

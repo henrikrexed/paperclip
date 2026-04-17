@@ -170,6 +170,33 @@ describe("handleCostMetrics", () => {
     });
   });
 
+  it("emits gen_ai.token.type=cache_read histogram record when cachedInputTokens is present", async () => {
+    const { ctx, meter } = createTestTelemetryCtx();
+    await handleCostMetrics(
+      makeEvent("cost_event.created", {
+        agentId: "a-1",
+        provider: "claude_local",
+        model: "claude-sonnet-4-20250514",
+        inputTokens: 1000,
+        outputTokens: 200,
+        cachedInputTokens: 750,
+        costCents: 3.5,
+        billingType: "usage",
+        biller: "anthropic",
+      }),
+      ctx,
+    );
+
+    const tokenHist = meter._histograms.get("gen_ai.client.token.usage");
+    expect(tokenHist!.record).toHaveBeenCalledTimes(3);
+    expect(tokenHist!.record).toHaveBeenCalledWith(750, {
+      "gen_ai.operation.name": "chat",
+      "gen_ai.provider.name": "anthropic",
+      "gen_ai.request.model": "claude-sonnet-4-20250514",
+      "gen_ai.token.type": "cache_read",
+    });
+  });
+
   it("skips null token/cost fields without error", async () => {
     const { ctx, meter } = createTestTelemetryCtx();
     await handleCostMetrics(makeEvent("cost_event.created", {}), ctx);
