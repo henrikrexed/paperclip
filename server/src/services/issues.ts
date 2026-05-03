@@ -25,6 +25,7 @@ import {
 import type { IssueRelationIssueSummary } from "@paperclipai/shared";
 import { extractAgentMentionIds, extractProjectMentionIds, isUuidLike } from "@paperclipai/shared";
 import { conflict, notFound, unprocessable } from "../errors.js";
+import { instrumentQuery } from "./db-instrumentation.js";
 import {
   defaultIssueExecutionWorkspaceSettingsForProject,
   gateProjectExecutionWorkspacePolicy,
@@ -79,6 +80,7 @@ export interface IssueFilters {
   originKind?: string;
   originId?: string;
   includeRoutineExecutions?: boolean;
+  excludeRoutineExecutions?: boolean;
   q?: string;
   limit?: number;
 }
@@ -131,6 +133,7 @@ function sameRunLock(checkoutRunId: string | null, actorRunId: string | null) {
 }
 
 const TERMINAL_HEARTBEAT_RUN_STATUSES = new Set(["succeeded", "failed", "cancelled", "timed_out"]);
+const ISSUE_LIST_DESCRIPTION_MAX_CHARS = 1200;
 
 function escapeLikePattern(value: string): string {
   return value.replace(/[\\%_]/g, "\\$&");
@@ -525,6 +528,51 @@ async function activeRunMapForIssues(
   }
   return map;
 }
+
+const issueListSelect = {
+  id: issues.id,
+  companyId: issues.companyId,
+  projectId: issues.projectId,
+  projectWorkspaceId: issues.projectWorkspaceId,
+  goalId: issues.goalId,
+  parentId: issues.parentId,
+  title: issues.title,
+  description: sql<string | null>`
+    CASE
+      WHEN ${issues.description} IS NULL THEN NULL
+      ELSE substring(${issues.description} FROM 1 FOR ${ISSUE_LIST_DESCRIPTION_MAX_CHARS})
+    END
+  `,
+  status: issues.status,
+  priority: issues.priority,
+  assigneeAgentId: issues.assigneeAgentId,
+  assigneeUserId: issues.assigneeUserId,
+  checkoutRunId: issues.checkoutRunId,
+  executionRunId: issues.executionRunId,
+  executionAgentNameKey: issues.executionAgentNameKey,
+  executionLockedAt: issues.executionLockedAt,
+  createdByAgentId: issues.createdByAgentId,
+  createdByUserId: issues.createdByUserId,
+  issueNumber: issues.issueNumber,
+  identifier: issues.identifier,
+  originKind: issues.originKind,
+  originId: issues.originId,
+  originRunId: issues.originRunId,
+  requestDepth: issues.requestDepth,
+  billingCode: issues.billingCode,
+  assigneeAdapterOverrides: issues.assigneeAdapterOverrides,
+  executionPolicy: sql<null>`null`,
+  executionState: sql<null>`null`,
+  executionWorkspaceId: issues.executionWorkspaceId,
+  executionWorkspacePreference: issues.executionWorkspacePreference,
+  executionWorkspaceSettings: sql<null>`null`,
+  startedAt: issues.startedAt,
+  completedAt: issues.completedAt,
+  cancelledAt: issues.cancelledAt,
+  hiddenAt: issues.hiddenAt,
+  createdAt: issues.createdAt,
+  updatedAt: issues.updatedAt,
+};
 
 function withActiveRuns(
   issueRows: IssueWithLabels[],
@@ -985,7 +1033,7 @@ export function issueService(db: Db) {
           )!,
         );
       }
-      if (!filters?.includeRoutineExecutions && !filters?.originKind && !filters?.originId) {
+      if (filters?.excludeRoutineExecutions && !filters?.originKind && !filters?.originId) {
         conditions.push(ne(issues.originKind, "routine_execution"));
       }
       conditions.push(isNull(issues.hiddenAt));
@@ -1004,7 +1052,7 @@ export function issueService(db: Db) {
       `;
       const canonicalLastActivityAt = issueCanonicalLastActivityAtExpr(companyId);
       const baseQuery = db
-        .select()
+        .select(issueListSelect)
         .from(issues)
         .where(and(...conditions))
         .orderBy(
@@ -1162,7 +1210,6 @@ export function issueService(db: Db) {
         eq(issues.companyId, companyId),
         isNull(issues.hiddenAt),
         unreadForUserCondition(companyId, userId),
-        ne(issues.originKind, "routine_execution"),
       ];
       if (status) {
         const statuses = status.split(",").map((s) => s.trim()).filter(Boolean);
@@ -1533,7 +1580,10 @@ export function issueService(db: Db) {
           values.cancelledAt = new Date();
         }
 
-        const [issue] = await tx.insert(issues).values(values).returning();
+        const [issue] = await instrumentQuery(
+          { operation: "insert", table: "issues", description: "issue create", companyId },
+          () => tx.insert(issues).values(values).returning(),
+        );
         if (inputLabelIds) {
           await syncIssueLabels(issue.id, companyId, inputLabelIds, tx);
         }
@@ -1667,12 +1717,15 @@ export function issueService(db: Db) {
           projectGoalId: nextProjectGoalId,
           defaultGoalId: defaultCompanyGoal?.id ?? null,
         });
-        const updated = await tx
-          .update(issues)
-          .set(patch)
-          .where(eq(issues.id, id))
-          .returning()
-          .then((rows: Array<typeof issues.$inferSelect>) => rows[0] ?? null);
+        const updated = await instrumentQuery<typeof issues.$inferSelect | null>(
+          { operation: "update", table: "issues", description: "issue update", companyId: existing.companyId },
+          () => tx
+            .update(issues)
+            .set(patch)
+            .where(eq(issues.id, id))
+            .returning()
+            .then((rows: Array<typeof issues.$inferSelect>) => rows[0] ?? null),
+        );
         if (!updated) return null;
         if (nextLabelIds !== undefined) {
           await syncIssueLabels(updated.id, existing.companyId, nextLabelIds, tx);
@@ -1783,27 +1836,30 @@ export function issueService(db: Db) {
       const executionLockCondition = checkoutRunId
         ? or(isNull(issues.executionRunId), eq(issues.executionRunId, checkoutRunId))
         : isNull(issues.executionRunId);
-      const updated = await db
-        .update(issues)
-        .set({
-          assigneeAgentId: agentId,
-          assigneeUserId: null,
-          checkoutRunId,
-          executionRunId: checkoutRunId,
-          status: "in_progress",
-          startedAt: now,
-          updatedAt: now,
-        })
-        .where(
-          and(
-            eq(issues.id, id),
-            inArray(issues.status, expectedStatuses),
-            or(isNull(issues.assigneeAgentId), sameRunAssigneeCondition),
-            executionLockCondition,
-          ),
-        )
-        .returning()
-        .then((rows) => rows[0] ?? null);
+      const updated = await instrumentQuery(
+        { operation: "update", table: "issues", description: "issue checkout", agentId, runId: checkoutRunId ?? undefined },
+        () => db
+          .update(issues)
+          .set({
+            assigneeAgentId: agentId,
+            assigneeUserId: null,
+            checkoutRunId,
+            executionRunId: checkoutRunId,
+            status: "in_progress",
+            startedAt: now,
+            updatedAt: now,
+          })
+          .where(
+            and(
+              eq(issues.id, id),
+              inArray(issues.status, expectedStatuses),
+              or(isNull(issues.assigneeAgentId), sameRunAssigneeCondition),
+              executionLockCondition,
+            ),
+          )
+          .returning()
+          .then((rows) => rows[0] ?? null),
+      );
 
       if (updated) {
         const [enriched] = await withIssueLabels(db, [updated]);
@@ -2350,7 +2406,10 @@ export function issueService(db: Db) {
       return [...resolved];
     },
 
-    findMentionedProjectIds: async (issueId: string) => {
+    findMentionedProjectIds: async (
+      issueId: string,
+      opts?: { includeCommentBodies?: boolean },
+    ) => {
       const issue = await db
         .select({
           companyId: issues.companyId,
@@ -2362,21 +2421,26 @@ export function issueService(db: Db) {
         .then((rows) => rows[0] ?? null);
       if (!issue) return [];
 
-      const comments = await db
-        .select({ body: issueComments.body })
-        .from(issueComments)
-        .where(eq(issueComments.issueId, issueId));
-
       const mentionedIds = new Set<string>();
-      for (const source of [
-        issue.title,
-        issue.description ?? "",
-        ...comments.map((comment) => comment.body),
-      ]) {
+      for (const source of [issue.title, issue.description ?? ""]) {
         for (const projectId of extractProjectMentionIds(source)) {
           mentionedIds.add(projectId);
         }
       }
+
+      if (opts?.includeCommentBodies !== false) {
+        const comments = await db
+          .select({ body: issueComments.body })
+          .from(issueComments)
+          .where(eq(issueComments.issueId, issueId));
+
+        for (const comment of comments) {
+          for (const projectId of extractProjectMentionIds(comment.body)) {
+            mentionedIds.add(projectId);
+          }
+        }
+      }
+
       if (mentionedIds.size === 0) return [];
 
       const rows = await db

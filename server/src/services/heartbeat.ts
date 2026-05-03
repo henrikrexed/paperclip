@@ -19,6 +19,7 @@ import {
   projectWorkspaces,
 } from "@paperclipai/db";
 import { conflict, HttpError, notFound } from "../errors.js";
+import { instrumentQuery } from "./db-instrumentation.js";
 import { logger } from "../middleware/logger.js";
 import { publishLiveEvent } from "./live-events.js";
 import { getRunLogStore, type RunLogHandle } from "./run-log-store.js";
@@ -26,6 +27,7 @@ import { getServerAdapter, runningProcesses } from "../adapters/index.js";
 import type { AdapterExecutionResult, AdapterInvocationMeta, AdapterSessionCodec, UsageSummary } from "../adapters/index.js";
 import { createLocalAgentJwt } from "../agent-auth-jwt.js";
 import { parseObject, asBoolean, asNumber, appendWithCap, MAX_EXCERPT_BYTES } from "../adapters/utils.js";
+import { withHeartbeatSpan } from "./trace-context.js";
 import { costService } from "./costs.js";
 import { trackAgentFirstHeartbeat } from "@paperclipai/shared/telemetry";
 import { getTelemetryClient } from "../telemetry.js";
@@ -93,6 +95,11 @@ const MAX_INLINE_WAKE_COMMENTS = 8;
 const MAX_INLINE_WAKE_COMMENT_BODY_CHARS = 4_000;
 const MAX_INLINE_WAKE_COMMENT_BODY_TOTAL_CHARS = 12_000;
 const execFile = promisify(execFileCallback);
+// HTTP-based adapters that do not spawn child processes and should not be reaped by orphan detection
+const HTTP_BASED_ADAPTERS = new Set([
+  "ollama_agent",
+]);
+
 const ACTIVE_HEARTBEAT_RUN_STATUSES = ["queued", "running"] as const;
 const SESSIONED_LOCAL_ADAPTERS = new Set([
   "claude_local",
@@ -2152,6 +2159,40 @@ export function heartbeatService(db: Db) {
           finishedAt: updated.finishedAt ? new Date(updated.finishedAt).toISOString() : null,
         },
       });
+
+      // Emit plugin events for run lifecycle transitions
+      const pluginAction =
+        status === "succeeded"  ? "agent.run.finished" :
+        status === "failed"     ? "agent.run.failed" :
+        status === "timed_out"  ? "agent.run.failed" :
+        status === "cancelled"  ? "agent.run.cancelled" :
+        null;
+      if (pluginAction) {
+        const runCtx = parseObject(updated.contextSnapshot);
+        void logActivity(db, {
+          companyId: updated.companyId,
+          actorType: "system",
+          actorId: "heartbeat-service",
+          action: pluginAction,
+          entityType: "heartbeat_run",
+          entityId: updated.id,
+          agentId: updated.agentId,
+          runId: updated.id,
+          details: {
+            agentId: updated.agentId,
+            status: updated.status,
+            invocationSource: updated.invocationSource,
+            triggerDetail: updated.triggerDetail ?? null,
+            issueId: readNonEmptyString(runCtx.issueId) ?? null,
+            error: updated.error ?? null,
+            errorCode: updated.errorCode ?? null,
+            durationMs: updated.startedAt && updated.finishedAt
+              ? new Date(updated.finishedAt).getTime() - new Date(updated.startedAt).getTime()
+              : null,
+            exitCode: updated.exitCode ?? null,
+          },
+        });
+      }
     }
 
     return updated;
@@ -2628,16 +2669,19 @@ export function heartbeatService(db: Db) {
     }
 
     const claimedAt = new Date();
-    const claimed = await db
-      .update(heartbeatRuns)
-      .set({
-        status: "running",
-        startedAt: run.startedAt ?? claimedAt,
-        updatedAt: claimedAt,
-      })
-      .where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "queued")))
-      .returning()
-      .then((rows) => rows[0] ?? null);
+    const claimed = await instrumentQuery(
+      { operation: "update", table: "heartbeat_runs", description: "run claim", companyId: run.companyId, agentId: run.agentId, runId: run.id },
+      () => db
+        .update(heartbeatRuns)
+        .set({
+          status: "running",
+          startedAt: run.startedAt ?? claimedAt,
+          updatedAt: claimedAt,
+        })
+        .where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "queued")))
+        .returning()
+        .then((rows) => rows[0] ?? null),
+    );
     if (!claimed) return null;
 
     publishLiveEvent({
@@ -2754,6 +2798,9 @@ export function heartbeatService(db: Db) {
 
     for (const { run, adapterType } of activeRuns) {
       if (runningProcesses.has(run.id) || activeRunExecutions.has(run.id)) continue;
+
+      // Skip HTTP-based adapters (no child process to track)
+      if (HTTP_BASED_ADAPTERS.has(adapterType)) continue;
 
       // Apply staleness threshold to avoid false positives
       if (staleThresholdMs > 0) {
@@ -3228,6 +3275,14 @@ export function heartbeatService(db: Db) {
 
     activeRunExecutions.add(run.id);
 
+    await withHeartbeatSpan(
+      run.id,
+      run.agentId,
+      {
+        "paperclip.company.id": run.companyId,
+        "paperclip.run.invocation_source": run.invocationSource ?? "",
+      },
+      async () => {
     try {
     const agent = await getAgent(run.agentId);
     if (!agent) {
@@ -3245,8 +3300,30 @@ export function heartbeatService(db: Db) {
       return;
     }
 
+    // Emit agent.run.started inside withHeartbeatSpan so the event carries
+    // server trace context for proper distributed trace linking in plugins.
+    const runContext = parseObject(run.contextSnapshot);
+    void logActivity(db, {
+      companyId: run.companyId,
+      actorType: "system",
+      actorId: "heartbeat-service",
+      action: "agent.run.started",
+      entityType: "heartbeat_run",
+      entityId: run.id,
+      agentId: run.agentId,
+      runId: run.id,
+      details: {
+        agentId: run.agentId,
+        agentName: agent?.name ?? null,
+        status: run.status,
+        invocationSource: run.invocationSource,
+        triggerDetail: run.triggerDetail ?? null,
+        issueId: readNonEmptyString(runContext.issueId) ?? null,
+      },
+    });
+
     const runtime = await ensureRuntimeState(agent);
-    const context = parseObject(run.contextSnapshot);
+    const context = runContext;
     const taskKey = deriveTaskKeyWithHeartbeatFallback(context, null);
     const sessionCodec = getAdapterSessionCodec(agent.adapterType);
     const issueId = readNonEmptyString(context.issueId);
@@ -4202,6 +4279,7 @@ export function heartbeatService(db: Db) {
           activeRunExecutions.delete(run.id);
           await startNextQueuedRunForAgent(run.agentId);
         }
+    }); // end withHeartbeatSpan
   }
 
   async function releaseIssueExecutionAndPromote(run: typeof heartbeatRuns.$inferSelect) {
