@@ -1844,6 +1844,7 @@ export function heartbeatService(db: Db) {
   async function finalizeAgentStatus(
     agentId: string,
     outcome: "succeeded" | "failed" | "cancelled" | "timed_out",
+    errorMessage?: string | null,
   ) {
     const existing = await getAgent(agentId);
     if (!existing) return;
@@ -1860,10 +1861,16 @@ export function heartbeatService(db: Db) {
           ? "idle"
           : "error";
 
+    const trimmedError =
+      typeof errorMessage === "string" ? errorMessage.trim() : null;
+    const nextLastErrorMessage =
+      nextStatus === "error" ? (trimmedError && trimmedError.length > 0 ? trimmedError : null) : null;
+
     const updated = await db
       .update(agents)
       .set({
         status: nextStatus,
+        lastErrorMessage: nextLastErrorMessage,
         lastHeartbeatAt: new Date(),
         updatedAt: new Date(),
       })
@@ -1881,6 +1888,7 @@ export function heartbeatService(db: Db) {
           lastHeartbeatAt: updated.lastHeartbeatAt
             ? new Date(updated.lastHeartbeatAt).toISOString()
             : null,
+          lastErrorMessage: updated.lastErrorMessage ?? null,
           outcome,
         },
       });
@@ -1978,7 +1986,11 @@ export function heartbeatService(db: Db) {
         },
       });
 
-      await finalizeAgentStatus(run.agentId, "failed");
+      await finalizeAgentStatus(
+        run.agentId,
+        "failed",
+        shouldRetry ? `${baseMessage}; retrying once` : baseMessage,
+      );
       await startNextQueuedRunForAgent(run.agentId);
       runningProcesses.delete(run.id);
       reaped.push(run.id);
@@ -2576,7 +2588,7 @@ export function heartbeatService(db: Db) {
 
       const runningAgent = await db
         .update(agents)
-        .set({ status: "running", updatedAt: new Date() })
+        .set({ status: "running", lastErrorMessage: null, updatedAt: new Date() })
         .where(eq(agents.id, agent.id))
         .returning()
         .then((rows) => rows[0] ?? null);
@@ -2588,6 +2600,7 @@ export function heartbeatService(db: Db) {
           payload: {
             agentId: runningAgent.id,
             status: runningAgent.status,
+            lastErrorMessage: runningAgent.lastErrorMessage ?? null,
             outcome: "running",
           },
         });
@@ -2861,15 +2874,17 @@ export function heartbeatService(db: Db) {
             } as Record<string, unknown>)
           : null;
 
+      const redactedAdapterError =
+        outcome === "succeeded"
+          ? null
+          : redactCurrentUserText(
+              adapterResult.errorMessage ?? (outcome === "timed_out" ? "Timed out" : "Adapter failed"),
+              currentUserRedactionOptions,
+            );
+
       await setRunStatus(run.id, status, {
         finishedAt: new Date(),
-        error:
-          outcome === "succeeded"
-            ? null
-            : redactCurrentUserText(
-                adapterResult.errorMessage ?? (outcome === "timed_out" ? "Timed out" : "Adapter failed"),
-                currentUserRedactionOptions,
-              ),
+        error: redactedAdapterError,
         errorCode:
           outcome === "timed_out"
             ? "timeout"
@@ -2934,7 +2949,7 @@ export function heartbeatService(db: Db) {
           }
         }
       }
-      await finalizeAgentStatus(agent.id, outcome);
+      await finalizeAgentStatus(agent.id, outcome, redactedAdapterError);
     } catch (err) {
       const message = redactCurrentUserText(
         err instanceof Error ? err.message : "Unknown adapter failure",
@@ -2998,7 +3013,7 @@ export function heartbeatService(db: Db) {
         }
       }
 
-      await finalizeAgentStatus(agent.id, "failed");
+      await finalizeAgentStatus(agent.id, "failed", message);
     }
     } catch (outerErr) {
           // Setup code before adapter.execute threw (e.g. ensureRuntimeState, resolveWorkspaceForRun).
@@ -3028,7 +3043,7 @@ export function heartbeatService(db: Db) {
           }
           // Ensure the agent is not left stuck in "running" if the inner catch handler's
           // DB calls threw (e.g. a transient DB error in finalizeAgentStatus).
-          await finalizeAgentStatus(run.agentId, "failed").catch(() => undefined);
+          await finalizeAgentStatus(run.agentId, "failed", message).catch(() => undefined);
         } finally {
           await releaseRuntimeServicesForRun(run.id).catch(() => undefined);
           activeRunExecutions.delete(run.id);
@@ -4019,6 +4034,8 @@ export function heartbeatService(db: Db) {
     wakeup: enqueueWakeup,
 
     reportRunActivity: clearDetachedRunWarning,
+
+    finalizeAgentStatus,
 
     reapOrphanedRuns,
 
