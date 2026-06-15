@@ -35,11 +35,24 @@ receivers:
         mute_process_exe_error: true
         mute_process_io_error: true
         mute_process_user_error: true
+        metrics:
+          process.cpu.utilization:
+            enabled: true
+          process.memory.utilization:
+            enabled: true
+          process.disk.io:
+            enabled: false
 
 processors:
   batch:
-    timeout: 200ms
-    send_batch_size: 512
+    timeout: 5s
+    send_batch_size: 1000
+    send_batch_max_size: 5000
+
+  batch/host:
+    timeout: 10s
+    send_batch_size: 500
+    send_batch_max_size: 1000
 
   memory_limiter:
     check_interval: 5s
@@ -143,7 +156,7 @@ service:
 
     metrics/host:
       receivers: [hostmetrics]
-      processors: [resourcedetection/system, resource/hostmetrics, cumulativetodelta, batch]
+      processors: [resourcedetection/system, resource/hostmetrics, cumulativetodelta, batch/host]
       exporters: [otlphttp/dynatrace]
 
     logs:
