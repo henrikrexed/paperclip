@@ -133,8 +133,12 @@ export function initOTel(config: ObservabilityConfig): OTelHandle {
         ),
       ],
     });
+    // Resolve the logger from our own provider rather than the global
+    // `logs.getLogger`: NodeSDK.start() already claims the global
+    // LoggerProvider, so a global lookup would route emits to NodeSDK's
+    // provider and our OTLP log exporter would never fire.
     logs.setGlobalLoggerProvider(loggerProvider);
-    otelLogger = logs.getLogger(PLUGIN_ID, config.serviceVersion);
+    otelLogger = loggerProvider.getLogger(PLUGIN_ID, config.serviceVersion);
   }
 
   return {
