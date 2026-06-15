@@ -145,7 +145,7 @@ function emitDbQueryEvent(
 
   const event: PluginEvent = {
     eventId: randomUUID(),
-    eventType: "db.query.completed" as PluginEvent["eventType"],
+    eventType: "db.query.completed",
     occurredAt: new Date().toISOString(),
     actorId: descriptor.agentId ?? "system",
     actorType: descriptor.agentId ? "agent" : "system",
