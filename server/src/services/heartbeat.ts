@@ -91,7 +91,7 @@ import {
   type RunLivenessClassificationInput,
 } from "./run-liveness.js";
 import { logActivity, publishPluginDomainEvent, type LogActivityInput } from "./activity-log.js";
-import { withHeartbeatSpan, withIssueSpan } from "./trace-context.js";
+import { withHeartbeatSpan, withIssueSpan, extractTraceContext } from "./trace-context.js";
 import {
   buildWorkspaceReadyComment,
   cleanupExecutionWorkspaceArtifacts,
@@ -4661,6 +4661,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               ? "agent.run.cancelled"
               : null;
     if (!eventType) return;
+    // Inline trace-context extraction (mirrors logActivity) so the plugin's
+    // `paperclip.heartbeat.run` span parents under the active server heartbeat/
+    // issue span instead of floating near-root. Present only when emitted within
+    // an active span (e.g. agent.run.started/finished raised inside executeRun's
+    // dispatch span); undefined for out-of-band transitions like cancellation.
+    const traceContext = extractTraceContext();
     publishPluginDomainEvent({
       eventId: randomUUID(),
       eventType,
@@ -4684,6 +4690,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         startedAt: run.startedAt ? new Date(run.startedAt).toISOString() : null,
         finishedAt: run.finishedAt ? new Date(run.finishedAt).toISOString() : null,
       },
+      ...(traceContext ? { traceContext } : {}),
     });
   }
 
@@ -6852,7 +6859,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         finishedAt: claimed.finishedAt ? new Date(claimed.finishedAt).toISOString() : null,
       },
     });
-    publishRunLifecyclePluginEvent(claimed);
+    // NOTE: the agent.run.started plugin event is intentionally NOT emitted here.
+    // Claiming runs outside the dispatch span (especially the batched
+    // startNextQueuedRunForAgent path), so emitting now would leave the event
+    // without server trace context and orphan the plugin run span. executeRun
+    // raises agent.run.started inside withHeartbeatSpan/withIssueSpan instead so
+    // the run span parents under the heartbeat/issue span (ISI-1324).
 
     await setWakeupStatus(claimed.wakeupRequestId, "claimed", { claimedAt });
 
@@ -7764,6 +7776,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     const heartbeatRunIssueId = readNonEmptyString(parseObject(run.contextSnapshot).issueId);
     const runWithinHeartbeatSpan = async () => {
+    // Raise agent.run.started here — inside withHeartbeatSpan/withIssueSpan — so
+    // the event carries the server span's traceContext and the plugin's
+    // paperclip.heartbeat.run span nests under the heartbeat/issue span. The run
+    // is already "running" (claimed by claimQueuedRun) before this point, so this
+    // still opens the run span at run start, before any adapter work (ISI-1324).
+    publishRunLifecyclePluginEvent(run);
     try {
     const agent = await getAgent(run.agentId);
     if (!agent) {

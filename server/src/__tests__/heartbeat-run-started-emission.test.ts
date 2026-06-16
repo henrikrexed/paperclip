@@ -18,7 +18,12 @@ import {
 // `claimQueuedRun` must route its "running" transition through the emitter so
 // `agent.run.started` opens the run span at run start (not just on finish).
 const publishedEvents = vi.hoisted(
-  () => [] as Array<{ eventType: string; runId: string }>,
+  () =>
+    [] as Array<{
+      eventType: string;
+      runId: string;
+      traceContext?: { traceId: string; spanId: string; traceFlags: number };
+    }>,
 );
 
 vi.mock("../services/activity-log.ts", async () => {
@@ -29,10 +34,15 @@ vi.mock("../services/activity-log.ts", async () => {
   return {
     ...actual,
     publishPluginDomainEvent: vi.fn(
-      (event: { eventType: string; payload?: Record<string, unknown> }) => {
+      (event: {
+        eventType: string;
+        payload?: Record<string, unknown>;
+        traceContext?: { traceId: string; spanId: string; traceFlags: number };
+      }) => {
         publishedEvents.push({
           eventType: event.eventType,
           runId: String(event.payload?.runId ?? ""),
+          traceContext: event.traceContext,
         });
       },
     ),
@@ -258,5 +268,20 @@ describeEmbeddedPostgres("heartbeat agent.run.started emission (ISI-1306 M2)", (
       .then((rows) => rows[0] ?? null);
     expect(run?.status).toBe("running");
     expect(run?.startedAt).not.toBeNull();
+
+    // ISI-1324: agent.run.started must carry the server span's trace context so
+    // the plugin's paperclip.heartbeat.run span parents under the heartbeat/issue
+    // span rather than floating near-root. The event is raised inside
+    // executeRun's withHeartbeatSpan/withIssueSpan, so a valid (non-zero) traceId
+    // must be present.
+    const startedEvent = publishedEvents.find(
+      (e) => e.runId === runId && e.eventType === "agent.run.started",
+    );
+    expect(startedEvent?.traceContext).toBeDefined();
+    expect(startedEvent?.traceContext?.traceId).toMatch(/^[0-9a-f]{32}$/);
+    expect(startedEvent?.traceContext?.traceId).not.toBe(
+      "00000000000000000000000000000000",
+    );
+    expect(startedEvent?.traceContext?.spanId).toMatch(/^[0-9a-f]{16}$/);
   });
 });
