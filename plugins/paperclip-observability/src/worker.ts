@@ -99,6 +99,10 @@ import {
   handleSessionCreatedLogs,
   handleSessionChunkTraces,
   handleSessionChunkMetrics,
+  handleSessionChatTraces,
+  handleSessionChatMetrics,
+  handleSessionToolTraces,
+  handleSessionToolMetrics,
   handleSessionStatusTraces,
   handleSessionDoneTraces,
   handleSessionDoneMetrics,
@@ -266,6 +270,14 @@ function createRouter(): EventTelemetryRouter {
   router.register("agent.session.chunk", handleSessionChunkTraces);
   router.register("agent.session.chunk", handleSessionChunkMetrics);
 
+  // agent.session.chat — per-turn LLM chat spans (OTel GenAI semconv)
+  router.register("agent.session.chat", handleSessionChatTraces);
+  router.register("agent.session.chat", handleSessionChatMetrics);
+
+  // agent.session.tool — tool/mcp/skill execution spans
+  router.register("agent.session.tool", handleSessionToolTraces);
+  router.register("agent.session.tool", handleSessionToolMetrics);
+
   // agent.session.status
   router.register("agent.session.status", handleSessionStatusTraces);
 
@@ -366,6 +378,8 @@ const plugin: PaperclipPlugin = definePlugin({
       // Session lifecycle events (emitted when server supports them)
       "agent.session.created",
       "agent.session.chunk",
+      "agent.session.chat",
+      "agent.session.tool",
       "agent.session.status",
       "agent.session.done",
       "agent.session.error",

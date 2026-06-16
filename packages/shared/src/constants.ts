@@ -1151,6 +1151,8 @@ export const PLUGIN_EVENT_TYPES = [
   "agent.session.created",
   "agent.session.chunk",
   "agent.session.status",
+  "agent.session.tool",
+  "agent.session.chat",
   "agent.session.done",
   "agent.session.error",
   "goal.created",

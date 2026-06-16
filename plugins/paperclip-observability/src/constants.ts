@@ -55,6 +55,8 @@ export const METRIC_NAMES = {
   sessionTtft: "paperclip.agent.session.ttft_ms",
   sessionChunks: "paperclip.agent.session.chunks",
   sessionErrors: "paperclip.agent.session.errors",
+  sessionToolExecutions: "paperclip.agent.session.tool_executions",
+  sessionChatTurns: "paperclip.agent.session.chat_turns",
 
   // Activity observability metrics
   activityCount: "paperclip.agent.activity.count",

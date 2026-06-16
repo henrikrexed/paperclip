@@ -140,7 +140,7 @@ describe("worker", () => {
   });
 
   describe("setup", () => {
-    it("subscribes to all 18 event types", async () => {
+    it("subscribes to all 20 event types", async () => {
       const mockCtx = createMockPluginContext();
       await holder.definition.setup(mockCtx);
 
@@ -161,11 +161,13 @@ describe("worker", () => {
       expect(eventTypesSubscribed).toContain("activity.logged");
       expect(eventTypesSubscribed).toContain("agent.session.created");
       expect(eventTypesSubscribed).toContain("agent.session.chunk");
+      expect(eventTypesSubscribed).toContain("agent.session.chat");
+      expect(eventTypesSubscribed).toContain("agent.session.tool");
       expect(eventTypesSubscribed).toContain("agent.session.status");
       expect(eventTypesSubscribed).toContain("agent.session.done");
       expect(eventTypesSubscribed).toContain("agent.session.error");
       expect(eventTypesSubscribed).toContain("db.query.completed");
-      expect(mockCtx.events.on).toHaveBeenCalledTimes(18);
+      expect(mockCtx.events.on).toHaveBeenCalledTimes(20);
     });
 
     it("registers the collect-metrics job", async () => {

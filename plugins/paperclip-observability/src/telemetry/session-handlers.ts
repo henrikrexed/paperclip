@@ -16,7 +16,7 @@
  *   agent.session.error    — end session span with ERROR, increment error counter
  */
 
-import { SpanKind, SpanStatusCode, trace, context } from "@opentelemetry/api";
+import { SpanKind, SpanStatusCode, trace, context, type Span } from "@opentelemetry/api";
 import { SeverityNumber } from "@opentelemetry/api-logs";
 import type { PluginEvent } from "@paperclipai/plugin-sdk";
 import type { TelemetryContext } from "./router.js";
@@ -38,6 +38,17 @@ interface SessionMeta {
 }
 
 const sessionMeta = new Map<string, SessionMeta>();
+
+/**
+ * In-flight tool execution spans, keyed by `${sessionId}:${toolUseId}`. A
+ * tool_use block (phase "start") opens the span; the matching tool_result
+ * block (phase "end") closes it, giving real execution duration and status.
+ */
+const pendingToolSpans = new Map<string, Span>();
+
+function toolSpanKey(sessionId: string, toolUseId: string): string {
+  return `${sessionId}:${toolUseId}`;
+}
 
 function emitLog(
   ctx: TelemetryContext,
@@ -204,6 +215,161 @@ export async function handleSessionChunkMetrics(
     agent_id: agentId,
     agent_name: agentName,
     stream: String(p.stream ?? "stdout"),
+  });
+}
+
+// ---------------------------------------------------------------------------
+// agent.session.chat — per-turn LLM chat span (OTel GenAI semconv)
+// ---------------------------------------------------------------------------
+
+export async function handleSessionChatTraces(
+  event: PluginEvent,
+  ctx: TelemetryContext,
+): Promise<void> {
+  const p = event.payload as Record<string, unknown>;
+  const sessionId = String(p.sessionId ?? "");
+  if (!sessionId) return;
+
+  const parentSpan = ctx.activeSessionSpans.get(sessionId);
+  if (!parentSpan) return;
+
+  const model = String(p.model ?? "unknown");
+  const inputTokens = Number(p.inputTokens ?? 0);
+  const outputTokens = Number(p.outputTokens ?? 0);
+  const cachedInputTokens = Number(p.cachedInputTokens ?? 0);
+  const stopReason = p.stopReason != null ? String(p.stopReason) : undefined;
+
+  const agentId = String(p.agentId ?? "");
+  const agentName = String(p.agentName ?? "");
+  const tracer = ctx.getTracerForAgent(agentId, agentName);
+  const parentCtx = trace.setSpan(context.active(), parentSpan);
+
+  // Discrete stream-json lines do not expose per-turn start/end timestamps, so
+  // the chat turn is modelled as a point-in-time span: it captures the model
+  // and token usage for visibility, nested under the session span.
+  const span = tracer.startSpan(
+    `chat ${model}`,
+    {
+      kind: SpanKind.CLIENT,
+      attributes: {
+        "paperclip.session.id": sessionId,
+        "gen_ai.operation.name": "chat",
+        "gen_ai.system": "anthropic",
+        "gen_ai.request.model": model,
+        "gen_ai.response.model": model,
+        "gen_ai.usage.input_tokens": inputTokens,
+        "gen_ai.usage.output_tokens": outputTokens,
+        "gen_ai.usage.cached_input_tokens": cachedInputTokens,
+        ...(stopReason ? { "gen_ai.response.finish_reasons": stopReason } : {}),
+      },
+    },
+    parentCtx,
+  );
+  span.setStatus({ code: SpanStatusCode.OK });
+  span.end();
+}
+
+export async function handleSessionChatMetrics(
+  event: PluginEvent,
+  ctx: TelemetryContext,
+): Promise<void> {
+  const p = event.payload as Record<string, unknown>;
+  const meta = sessionMeta.get(String(p.sessionId ?? ""));
+  const chatCounter = ctx.meter.createCounter(METRIC_NAMES.sessionChatTurns, {
+    description: "Count of LLM chat turns observed in agent sessions",
+  });
+  chatCounter.add(1, {
+    agent_id: meta?.agentId ?? String(p.agentId ?? ""),
+    agent_name: meta?.agentName ?? String(p.agentName ?? ""),
+    model: String(p.model ?? "unknown"),
+  });
+}
+
+// ---------------------------------------------------------------------------
+// agent.session.tool — tool / MCP / skill execution spans
+// ---------------------------------------------------------------------------
+
+export async function handleSessionToolTraces(
+  event: PluginEvent,
+  ctx: TelemetryContext,
+): Promise<void> {
+  const p = event.payload as Record<string, unknown>;
+  const sessionId = String(p.sessionId ?? "");
+  const toolUseId = String(p.toolUseId ?? "");
+  if (!sessionId || !toolUseId) return;
+
+  const phase = String(p.phase ?? "");
+  const key = toolSpanKey(sessionId, toolUseId);
+
+  if (phase === "start") {
+    const parentSpan = ctx.activeSessionSpans.get(sessionId);
+    if (!parentSpan) return;
+
+    const toolName = String(p.toolName ?? "unknown");
+    const toolKind = String(p.toolKind ?? "tool");
+    const mcpServer = p.mcpServer != null ? String(p.mcpServer) : undefined;
+    const skillName = p.skillName != null ? String(p.skillName) : undefined;
+
+    const agentId = String(p.agentId ?? "");
+    const agentName = String(p.agentName ?? "");
+    const tracer = ctx.getTracerForAgent(agentId, agentName);
+    const parentCtx = trace.setSpan(context.active(), parentSpan);
+
+    const spanName =
+      toolKind === "mcp"
+        ? `mcp ${mcpServer ?? toolName}`
+        : toolKind === "skill"
+          ? `skill ${skillName ?? toolName}`
+          : `execute_tool ${toolName}`;
+
+    const attributes: Record<string, string> = {
+      "paperclip.session.id": sessionId,
+      "paperclip.tool.kind": toolKind,
+      "gen_ai.operation.name": "execute_tool",
+      "gen_ai.tool.name": toolName,
+    };
+    if (toolKind === "mcp" && mcpServer) attributes["mcp.server.name"] = mcpServer;
+    if (toolKind === "skill" && skillName) attributes["paperclip.skill.name"] = skillName;
+
+    const span = tracer.startSpan(
+      spanName,
+      { kind: SpanKind.INTERNAL, attributes },
+      parentCtx,
+    );
+    pendingToolSpans.set(key, span);
+    return;
+  }
+
+  if (phase === "end") {
+    const span = pendingToolSpans.get(key);
+    if (!span) return;
+    const isError = p.isError === true;
+    if (isError) {
+      span.setStatus({ code: SpanStatusCode.ERROR, message: "tool_error" });
+      span.setAttribute("error.type", "tool_error");
+    } else {
+      span.setStatus({ code: SpanStatusCode.OK });
+    }
+    span.end();
+    pendingToolSpans.delete(key);
+  }
+}
+
+export async function handleSessionToolMetrics(
+  event: PluginEvent,
+  ctx: TelemetryContext,
+): Promise<void> {
+  const p = event.payload as Record<string, unknown>;
+  if (String(p.phase ?? "") !== "end") return;
+
+  const meta = sessionMeta.get(String(p.sessionId ?? ""));
+  const toolCounter = ctx.meter.createCounter(METRIC_NAMES.sessionToolExecutions, {
+    description: "Count of tool/MCP/skill executions observed in agent sessions",
+  });
+  toolCounter.add(1, {
+    agent_id: meta?.agentId ?? String(p.agentId ?? ""),
+    agent_name: meta?.agentName ?? String(p.agentName ?? ""),
+    status: p.isError === true ? "error" : "ok",
   });
 }
 

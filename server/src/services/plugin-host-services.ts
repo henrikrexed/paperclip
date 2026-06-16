@@ -71,6 +71,7 @@ import { request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
 import { isIP } from "node:net";
 import { logger } from "../middleware/logger.js";
+import { decodeAgentStreamTelemetry } from "@paperclipai/adapter-utils";
 import { getTelemetryClient } from "../telemetry.js";
 import { accessService } from "./access.js";
 import { authorizationService, type AuthorizationActor } from "./authorization.js";
@@ -2673,6 +2674,8 @@ export function buildHostServices(
           eventType:
             | "agent.session.chunk"
             | "agent.session.status"
+            | "agent.session.tool"
+            | "agent.session.chat"
             | "agent.session.done"
             | "agent.session.error",
           extra: Record<string, unknown>,
@@ -2731,6 +2734,39 @@ export function buildHostServices(
                 stream: stream ?? "stdout",
                 message: message ?? "",
               });
+
+              // Decode the chunk's structured stream-json blocks into
+              // first-class telemetry events so the observability plugin can
+              // emit per-turn chat spans and tool/MCP/skill execution spans.
+              // The decoder carries only structural metadata (names, token
+              // counts, error flags) — never raw tool/message bodies — so no
+              // agent-authored content reaches telemetry.
+              for (const block of decodeAgentStreamTelemetry(message ?? "")) {
+                if (block.kind === "chat") {
+                  emitSessionTelemetry("agent.session.chat", {
+                    model: block.model,
+                    inputTokens: block.inputTokens,
+                    outputTokens: block.outputTokens,
+                    cachedInputTokens: block.cachedInputTokens,
+                    stopReason: block.stopReason,
+                  });
+                } else if (block.kind === "tool_use") {
+                  emitSessionTelemetry("agent.session.tool", {
+                    phase: "start",
+                    toolUseId: block.toolUseId,
+                    toolName: block.toolName,
+                    toolKind: block.toolKind,
+                    mcpServer: block.mcpServer,
+                    skillName: block.skillName,
+                  });
+                } else if (block.kind === "tool_result") {
+                  emitSessionTelemetry("agent.session.tool", {
+                    phase: "end",
+                    toolUseId: block.toolUseId,
+                    isError: block.isError,
+                  });
+                }
+              }
             } else if (event.type === "heartbeat.run.status") {
               const status = payload.status as string;
               if (TERMINAL_STATUSES.has(status)) {
