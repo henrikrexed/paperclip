@@ -1,11 +1,13 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, afterEach } from "vitest";
 import { trace } from "@opentelemetry/api";
+import { BatchSpanProcessor, SimpleSpanProcessor } from "@opentelemetry/sdk-trace-base";
 import {
   withHeartbeatSpan,
   withIssueSpan,
   withConferenceRoomSpan,
   startChildSpan,
   extractTraceContext,
+  buildSpanProcessor,
 } from "../services/trace-context.js";
 
 describe("server trace-context keystone (ISI-1304)", () => {
@@ -44,6 +46,29 @@ describe("server trace-context keystone (ISI-1304)", () => {
     // Same trace, distinct spans → child-parent linkage within one trace tree.
     expect(issueCtx?.traceId).toBe(heartbeatCtx?.traceId);
     expect(issueCtx?.spanId).not.toBe(heartbeatCtx?.spanId);
+  });
+});
+
+describe("server span export wiring (ISI-1325 R4)", () => {
+  const original = process.env.OTEL_EXPORTER_OTLP_ENDPOINT;
+  afterEach(() => {
+    if (original === undefined) delete process.env.OTEL_EXPORTER_OTLP_ENDPOINT;
+    else process.env.OTEL_EXPORTER_OTLP_ENDPOINT = original;
+  });
+
+  it("exports via a BatchSpanProcessor when an OTLP endpoint is configured", () => {
+    process.env.OTEL_EXPORTER_OTLP_ENDPOINT = "http://localhost:4318";
+    expect(buildSpanProcessor()).toBeInstanceOf(BatchSpanProcessor);
+  });
+
+  it("discards spans (NoopExporter via SimpleSpanProcessor) when no endpoint is set", () => {
+    delete process.env.OTEL_EXPORTER_OTLP_ENDPOINT;
+    expect(buildSpanProcessor()).toBeInstanceOf(SimpleSpanProcessor);
+  });
+
+  it("treats a whitespace-only endpoint as unset", () => {
+    process.env.OTEL_EXPORTER_OTLP_ENDPOINT = "   ";
+    expect(buildSpanProcessor()).toBeInstanceOf(SimpleSpanProcessor);
   });
 });
 

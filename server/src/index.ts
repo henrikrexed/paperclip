@@ -4,6 +4,7 @@
 // instrumentationReady before opening DB connections or constructing the
 // HTTP server, so trace coverage does not depend on incidental timing.
 import { instrumentationReady, shutdownInstrumentation } from "./instrumentation.js";
+import { shutdownServerTracing } from "./services/trace-context.js";
 import { existsSync, readFileSync, rmSync } from "node:fs";
 import { createServer } from "node:http";
 import { resolve } from "node:path";
@@ -1013,8 +1014,10 @@ export async function startServer(): Promise<StartedServer> {
       }
 
       // Flush buffered OTel spans before the process goes away; without this
-      // await the exporter's final batch is dropped on exit.
+      // await the exporter's final batch is dropped on exit. Covers both the
+      // auto-instrumentation NodeSDK and the server's own BatchSpanProcessor.
       await shutdownInstrumentation();
+      await shutdownServerTracing();
 
       process.exit(0);
     };

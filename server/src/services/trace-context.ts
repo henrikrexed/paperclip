@@ -2,18 +2,33 @@
  * Server-side trace context — creates real spans and propagates context to plugins.
  *
  * Registers a BasicTracerProvider so that spans have valid trace/span IDs.
- * No exporter is configured — the server's spans are ephemeral. Their purpose
- * is to generate trace context that the observability plugin receives via
- * PluginEvent.traceContext, allowing the plugin to parent its exported spans
- * under the server's trace hierarchy for true distributed tracing.
  *
- * If an external auto-instrumentation agent is present (e.g. via
- * OTEL_NODE_OPTIONS), it will register its own TracerProvider first and
- * this module's init becomes a no-op (the API global is already set).
+ * Export behaviour depends on `OTEL_EXPORTER_OTLP_ENDPOINT`:
+ *   - Set   → the server's own spans (heartbeat dispatch, issue, db) are
+ *             exported to the collector via an OTLP/HTTP BatchSpanProcessor,
+ *             so the server run span anchors the trace in the backend.
+ *   - Unset → a NoopExporter is used. Spans are ephemeral; their only purpose
+ *             is to generate trace context that the observability plugin
+ *             receives via PluginEvent.traceContext and re-exports.
+ *
+ * The auto-instrumentation NodeSDK in instrumentation.ts is the richer
+ * alternative (HTTP/Express/PG spans), but it requires the optional
+ * @opentelemetry/sdk-node + auto-instrumentations-node packages. When those
+ * are absent it fails gracefully and registers no provider; this module then
+ * becomes the export path. When a NodeSDK provider *is* present, the
+ * `hasProvider` probe below defers to it — so there is never a double provider.
  */
 
-import { trace, context, SpanKind, type Span, type Tracer } from "@opentelemetry/api";
-import { BasicTracerProvider, SimpleSpanProcessor, type SpanExporter, type ReadableSpan } from "@opentelemetry/sdk-trace-base";
+import { trace, context, SpanKind, type Context, type Span, type Tracer } from "@opentelemetry/api";
+import {
+  BasicTracerProvider,
+  BatchSpanProcessor,
+  SimpleSpanProcessor,
+  type SpanExporter,
+  type SpanProcessor,
+  type ReadableSpan,
+} from "@opentelemetry/sdk-trace-base";
+import { OTLPTraceExporter } from "@opentelemetry/exporter-trace-otlp-proto";
 import { resourceFromAttributes } from "@opentelemetry/resources";
 import { AsyncLocalStorageContextManager } from "@opentelemetry/context-async-hooks";
 
@@ -22,6 +37,7 @@ const TRACER_VERSION = "0.1.0";
 
 let _initialized = false;
 let _tracer: Tracer | null = null;
+let _provider: BasicTracerProvider | null = null;
 
 /**
  * A no-op exporter that discards all spans.
@@ -34,6 +50,23 @@ class NoopExporter implements SpanExporter {
   shutdown(): Promise<void> {
     return Promise.resolve();
   }
+}
+
+/**
+ * Build the span processor for the server's own provider. When an OTLP
+ * endpoint is configured the spans are exported to the collector; otherwise
+ * they are discarded (the trace context is still generated for the plugin).
+ *
+ * The exporter is constructed without an explicit `url` so it reads
+ * OTEL_EXPORTER_OTLP_ENDPOINT itself and appends the `/v1/traces` path per the
+ * OTLP spec — matching instrumentation.ts's HTTP path exactly.
+ */
+export function buildSpanProcessor(): SpanProcessor {
+  const endpoint = process.env.OTEL_EXPORTER_OTLP_ENDPOINT?.trim();
+  if (endpoint) {
+    return new BatchSpanProcessor(new OTLPTraceExporter());
+  }
+  return new SimpleSpanProcessor(new NoopExporter());
 }
 
 /**
@@ -65,8 +98,9 @@ export function initServerTracing(): void {
 
   const provider = new BasicTracerProvider({
     resource,
-    spanProcessors: [new SimpleSpanProcessor(new NoopExporter())],
+    spanProcessors: [buildSpanProcessor()],
   });
+  _provider = provider;
 
   // Register async context propagation so startActiveSpan/getActiveSpan work
   // across async boundaries (required for trace context to flow through await).
@@ -75,6 +109,24 @@ export function initServerTracing(): void {
 
   // Register as global so trace.getTracer() and trace.getActiveSpan() work.
   trace.setGlobalTracerProvider(provider);
+}
+
+/**
+ * Flush and shut down the server's TracerProvider. When the BatchSpanProcessor
+ * is active this drains the final buffered batch to the collector — without it,
+ * spans queued at exit are dropped. No-op when this module never created a
+ * provider (e.g. auto-instrumentation owns it, which index.ts shuts down via
+ * shutdownInstrumentation()).
+ */
+export async function shutdownServerTracing(): Promise<void> {
+  const provider = _provider;
+  if (!provider) return;
+  _provider = null;
+  try {
+    await provider.shutdown();
+  } catch {
+    // Best-effort flush; an unreachable collector must not block process exit.
+  }
 }
 
 function getTracer(): Tracer {
@@ -102,6 +154,22 @@ export function extractTraceContext(): { traceId: string; spanId: string; traceF
     spanId: sc.spanId,
     traceFlags: sc.traceFlags,
   };
+}
+
+/**
+ * Capture the currently-active OTel context and return a wrapper that re-enters
+ * it when invoked. Needed for callbacks fired from outside the active context —
+ * e.g. an adapter's stream-event sink, which the runner invokes from a child
+ * process's stdout handler where AsyncLocalStorage has already unwound. Calling
+ * this inside the run span and using the result for the callback guarantees
+ * `extractTraceContext()` (called downstream by logActivity) still resolves the
+ * run span, so per-turn events parent correctly under it.
+ */
+export function bindActiveContext<A extends unknown[]>(
+  fn: (...args: A) => Promise<void>,
+): (...args: A) => Promise<void> {
+  const captured: Context = context.active();
+  return (...args: A) => context.with(captured, () => fn(...args));
 }
 
 /**
