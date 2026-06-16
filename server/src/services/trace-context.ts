@@ -141,6 +141,50 @@ export function withHeartbeatSpan<T>(
 }
 
 /**
+ * Start a root span for one conference-room (board-chat) turn and execute
+ * `fn` within its context. The relay spawns the `claude` CLI and streams a
+ * reply; this span is the parent of the resulting comment events and any
+ * tool/turn child spans, giving the board a `conference_room.chat.turn`
+ * span tree on OTLP egress.
+ */
+export function withConferenceRoomSpan<T>(
+  attrs: Record<string, string | number>,
+  fn: (span: Span) => Promise<T>,
+): Promise<T> {
+  const tracer = getTracer();
+  return tracer.startActiveSpan(
+    "conference_room.chat.turn",
+    { kind: SpanKind.SERVER, attributes: attrs },
+    async (span) => {
+      try {
+        return await fn(span);
+      } catch (err) {
+        span.recordException(err as Error);
+        span.setStatus({ code: 2 /* ERROR */, message: String(err) });
+        throw err;
+      } finally {
+        span.end();
+      }
+    },
+  );
+}
+
+/**
+ * Start a child span under an explicit parent. Needed where the active
+ * context is not propagated to the call site (e.g. EventEmitter callbacks
+ * such as a child process's stdout handler). The caller owns ending it.
+ */
+export function startChildSpan(
+  parent: Span,
+  name: string,
+  attrs: Record<string, string | number>,
+): Span {
+  const tracer = getTracer();
+  const parentCtx = trace.setSpan(context.active(), parent);
+  return tracer.startSpan(name, { kind: SpanKind.INTERNAL, attributes: attrs }, parentCtx);
+}
+
+/**
  * Start a span for an issue lifecycle operation (create/update/comment)
  * and execute `fn` within its context.
  */
