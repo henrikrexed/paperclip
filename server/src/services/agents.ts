@@ -24,6 +24,7 @@ import {
   type AgentEligibilityAgent,
 } from "@paperclipai/shared";
 import { conflict, notFound, unprocessable } from "../errors.js";
+import { instrumentQuery } from "./db-instrumentation.js";
 import { normalizeAgentPermissions } from "./agent-permissions.js";
 import { REDACTED_EVENT_VALUE, sanitizeRecord } from "../redaction.js";
 
@@ -306,11 +307,14 @@ export function agentService(db: Db) {
   }
 
   async function getById(id: string) {
-    const row = await db
-      .select()
-      .from(agents)
-      .where(eq(agents.id, id))
-      .then((rows) => rows[0] ?? null);
+    const row = await instrumentQuery(
+      { operation: "select", table: "agents", description: "agent lookup" },
+      () => db
+        .select()
+        .from(agents)
+        .where(eq(agents.id, id))
+        .then((rows) => rows[0] ?? null),
+    );
     if (!row) return null;
     const [companyRows, hydrated] = await Promise.all([
       listCompanyAgentRows(row.companyId),
