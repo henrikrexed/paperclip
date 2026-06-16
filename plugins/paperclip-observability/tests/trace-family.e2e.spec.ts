@@ -269,6 +269,15 @@ describe("OTLP-egress parent span family (ISI-1304)", () => {
     expect(costSpan!.traceId).toBe(SERVER_TRACE_ID);
     expect(costSpan!.parentSpanId).toBe(runSpan!.spanId);
 
+    // --- ISI-1308 M3 acceptance: chat turn span carries model + token attrs ---
+    // The run shows a chat-turn span with model + token attributes under the run
+    // span. These come from cost_event.created (token/model), not agent.session.*.
+    expect(costSpan!.attributes["gen_ai.operation.name"]).toBe("chat");
+    expect(costSpan!.attributes["gen_ai.request.model"]).toBe(MODEL);
+    expect(costSpan!.attributes["gen_ai.usage.input_tokens"]).toBe(100);
+    expect(costSpan!.attributes["gen_ai.usage.output_tokens"]).toBe(50);
+    expect(costSpan!.attributes["gen_ai.usage.total_tokens"]).toBe(150);
+
     // issue.comment.created lands as a span event on the run span.
     expect(runSpan!.eventNames).toContain("issue.comment.created");
 

@@ -673,6 +673,10 @@ export async function handleCostTraces(
     "gen_ai.usage.cache_read.input_tokens": Number(
       p.cachedInputTokens ?? 0,
     ),
+    // Rollup so dashboards can read a single token total off the chat turn span
+    // without summing input+output client-side (cache reads are a subset of input).
+    "gen_ai.usage.total_tokens":
+      Number(p.inputTokens ?? 0) + Number(p.outputTokens ?? 0),
   };
 
   // If this cost event belongs to an active run, create as a child span.
