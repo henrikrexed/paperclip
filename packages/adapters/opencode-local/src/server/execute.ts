@@ -44,7 +44,7 @@ import {
   readPaperclipIssueWorkModeFromContext,
   resolvePaperclipDesiredSkillNames,
 } from "@paperclipai/adapter-utils/server-utils";
-import { isOpenCodeUnknownSessionError, parseOpenCodeJsonl } from "./parse.js";
+import { createOpenCodeStreamEventParser, isOpenCodeUnknownSessionError, parseOpenCodeJsonl } from "./parse.js";
 import {
   ensureOpenCodeModelConfiguredAndAvailable,
   isTruthyEnvFlag,
@@ -207,7 +207,7 @@ async function buildOpenCodeSkillsDir(config: Record<string, unknown>): Promise<
 }
 
 export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> {
-  const { runId, agent, runtime, config, context, onLog, onMeta, onSpawn, authToken } = ctx;
+  const { runId, agent, runtime, config, context, onLog, onMeta, onSpawn, onStreamEvent, authToken } = ctx;
   const executionTarget = readAdapterExecutionTarget({
     executionTarget: ctx.executionTarget,
     legacyRemoteExecution: ctx.executionTransport?.remoteExecution,
@@ -594,6 +594,29 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         });
       }
 
+      // Live per-turn telemetry: tee stdout into the incremental stream parser
+      // so each assistant step (step_finish, carrying that step's usage) and
+      // each tool_use block fires a bus event as it arrives, letting the run
+      // span gain per-turn child spans. Best-effort — a parser failure must
+      // never break log streaming or the run itself.
+      const streamParser = onStreamEvent
+        ? createOpenCodeStreamEventParser((event) => onStreamEvent(event), {
+            model: model || undefined,
+          })
+        : null;
+      const procOnLog: typeof onLog = streamParser
+        ? async (stream, chunk) => {
+            if (stream === "stdout") {
+              try {
+                await streamParser.ingest(chunk);
+              } catch {
+                // telemetry is best-effort; never let it interrupt log capture
+              }
+            }
+            await onLog(stream, chunk);
+          }
+        : onLog;
+
       const proc = await runAdapterExecutionTargetProcess(runId, runtimeExecutionTarget, command, args, {
         cwd,
         env: preparedRuntimeConfig.env,
@@ -601,8 +624,16 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         timeoutSec,
         graceSec,
         onSpawn,
-        onLog,
+        onLog: procOnLog,
       });
+
+      if (streamParser) {
+        try {
+          await streamParser.flush();
+        } catch {
+          // best-effort flush of any trailing buffered line
+        }
+      }
       return {
         proc,
         rawStderr: proc.stderr,
