@@ -962,6 +962,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       billingType,
       costUsd: parsedStream.costUsd ?? asNumber(parsed.total_cost_usd, 0),
       resultJson: mergedResultJson,
+      toolCalls: parsedStream.toolCalls,
       summary: parsedStream.summary || asString(parsed.result, ""),
       clearSession:
         clearSessionForMaxTurns ||

@@ -152,6 +152,14 @@ function createToolSpan(
   if (resultStatus) spanAttrs["gen_ai.tool.call.result_status"] = resultStatus;
   if (durationMs !== null) spanAttrs["paperclip.tool.duration_ms"] = durationMs;
 
+  // MCP / skill detail (set by the runner-side tool-call emission seam).
+  const toolKind = typeof details?.toolKind === "string" ? details.toolKind : null;
+  if (toolKind) spanAttrs["gen_ai.tool.type"] = toolKind;
+  const mcpServer = typeof details?.mcpServer === "string" ? details.mcpServer : null;
+  if (mcpServer) spanAttrs["mcp.server.name"] = mcpServer;
+  const skillName = typeof details?.skillName === "string" ? details.skillName : null;
+  if (skillName) spanAttrs["paperclip.skill.name"] = skillName;
+
   const endTimeMs = Date.now();
   const startTimeMs = durationMs !== null ? endTimeMs - durationMs : endTimeMs;
 

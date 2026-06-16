@@ -71,6 +71,7 @@ export function createMockMeter(): Meter & {
 // ---------------------------------------------------------------------------
 
 export interface MockSpan extends Span {
+  _name?: string;
   _attributes: Record<string, unknown>;
   _status: { code: number; message?: string };
   _ended: boolean;
@@ -145,6 +146,7 @@ export function createMockTracer(): Tracer & { _lastSpan: MockSpan | null } {
     _lastSpan: null as MockSpan | null,
     startSpan(name: string, options?: unknown, _context?: unknown) {
       const span = createMockSpan();
+      span._name = name;
       if (options && typeof options === "object" && "attributes" in options) {
         Object.assign(span._attributes, (options as { attributes: Record<string, unknown> }).attributes);
       }

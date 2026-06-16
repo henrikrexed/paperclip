@@ -1,10 +1,49 @@
-import type { UsageSummary } from "@paperclipai/adapter-utils";
+import type { AdapterToolCallReport, UsageSummary } from "@paperclipai/adapter-utils";
 import {
   asString,
   asNumber,
   parseObject,
   parseJson,
 } from "@paperclipai/adapter-utils/server-utils";
+
+/**
+ * Classify a Claude CLI tool name into an MCP call, skill invocation, or
+ * ordinary tool, deriving the MCP server / skill name where applicable.
+ *
+ * MCP tools are named `mcp__<server>__<tool>`; skills are invoked via the
+ * built-in `Skill` tool whose input carries the skill name.
+ */
+function classifyClaudeToolUse(
+  name: string,
+  input: Record<string, unknown> | null,
+): AdapterToolCallReport {
+  let inputSummary: string | null = null;
+  if (input && Object.keys(input).length > 0) {
+    try {
+      inputSummary = JSON.stringify(input).slice(0, 256);
+    } catch {
+      inputSummary = null;
+    }
+  }
+
+  if (name.startsWith("mcp__")) {
+    const segments = name.split("__");
+    return {
+      name,
+      kind: "mcp",
+      mcpServer: segments[1] || null,
+      inputSummary,
+    };
+  }
+
+  if (name === "Skill") {
+    const skillName =
+      asString(input?.skill, "") || asString(input?.command, "") || null;
+    return { name, kind: "skill", skillName, inputSummary };
+  }
+
+  return { name, kind: "tool", inputSummary };
+}
 
 const CLAUDE_AUTH_REQUIRED_RE = /(?:not\s+logged\s+in|please\s+log\s+in|please\s+run\s+`?claude\s+login`?|login\s+required|requires\s+login|unauthorized|authentication\s+required)/i;
 const URL_RE = /(https?:\/\/[^\s'"`<>()[\]{};,!?]+[^\s'"`<>()[\]{};,!.?:]+)/gi;
@@ -19,6 +58,8 @@ export function parseClaudeStreamJson(stdout: string) {
   let model = "";
   let finalResult: Record<string, unknown> | null = null;
   const assistantTexts: string[] = [];
+  const toolCalls: AdapterToolCallReport[] = [];
+  const seenToolUseIds = new Set<string>();
 
   for (const rawLine of stdout.split(/\r?\n/)) {
     const line = rawLine.trim();
@@ -40,9 +81,20 @@ export function parseClaudeStreamJson(stdout: string) {
       for (const entry of content) {
         if (typeof entry !== "object" || entry === null || Array.isArray(entry)) continue;
         const block = entry as Record<string, unknown>;
-        if (asString(block.type, "") === "text") {
+        const blockType = asString(block.type, "");
+        if (blockType === "text") {
           const text = asString(block.text, "");
           if (text) assistantTexts.push(text);
+        } else if (blockType === "tool_use") {
+          const name = asString(block.name, "");
+          if (!name) continue;
+          // Streamed assistant messages can repeat a partial block before it
+          // finalizes; dedupe by tool_use id so each call yields one span.
+          const id = asString(block.id, "");
+          if (id && seenToolUseIds.has(id)) continue;
+          if (id) seenToolUseIds.add(id);
+          const call = classifyClaudeToolUse(name, parseObject(block.input));
+          toolCalls.push(id ? { ...call, id } : call);
         }
       }
       continue;
@@ -62,6 +114,7 @@ export function parseClaudeStreamJson(stdout: string) {
       usage: null as UsageSummary | null,
       summary: assistantTexts.join("\n\n").trim(),
       resultJson: null as Record<string, unknown> | null,
+      toolCalls,
     };
   }
 
@@ -82,6 +135,7 @@ export function parseClaudeStreamJson(stdout: string) {
     usage,
     summary,
     resultJson: finalResult,
+    toolCalls,
   };
 }
 

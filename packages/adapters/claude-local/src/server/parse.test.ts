@@ -5,7 +5,60 @@ import {
   isClaudePoisonedPreviousMessageIdError,
   isClaudeUnknownSessionError,
   isClaudeImageProcessingError,
+  parseClaudeStreamJson,
 } from "./parse.js";
+
+describe("parseClaudeStreamJson tool_use extraction", () => {
+  function assistantLine(content: unknown[]): string {
+    return JSON.stringify({
+      type: "assistant",
+      session_id: "sess-1",
+      message: { content },
+    });
+  }
+
+  it("classifies MCP, skill, and ordinary tool calls into toolCalls", () => {
+    const stdout = [
+      JSON.stringify({ type: "system", subtype: "init", session_id: "sess-1", model: "claude-opus-4-8" }),
+      assistantLine([
+        { type: "text", text: "working" },
+        { type: "tool_use", id: "t1", name: "Bash", input: { command: "ls" } },
+        { type: "tool_use", id: "t2", name: "mcp__mempalace__mempalace_search", input: { query: "x" } },
+        { type: "tool_use", id: "t3", name: "Skill", input: { skill: "blog-write" } },
+      ]),
+      JSON.stringify({ type: "result", session_id: "sess-1", result: "done", total_cost_usd: 0.01, usage: {} }),
+    ].join("\n");
+
+    const parsed = parseClaudeStreamJson(stdout);
+    expect(parsed.toolCalls).toHaveLength(3);
+
+    const [bash, mcp, skill] = parsed.toolCalls;
+    expect(bash).toMatchObject({ id: "t1", name: "Bash", kind: "tool" });
+    expect(mcp).toMatchObject({ id: "t2", name: "mcp__mempalace__mempalace_search", kind: "mcp", mcpServer: "mempalace" });
+    expect(skill).toMatchObject({ id: "t3", name: "Skill", kind: "skill", skillName: "blog-write" });
+    expect(bash.inputSummary).toContain("ls");
+  });
+
+  it("dedupes repeated tool_use blocks by id", () => {
+    const stdout = [
+      assistantLine([{ type: "tool_use", id: "dup", name: "Read", input: { path: "a" } }]),
+      assistantLine([{ type: "tool_use", id: "dup", name: "Read", input: { path: "a" } }]),
+      JSON.stringify({ type: "result", session_id: "sess-1", result: "ok", total_cost_usd: 0, usage: {} }),
+    ].join("\n");
+
+    const parsed = parseClaudeStreamJson(stdout);
+    expect(parsed.toolCalls).toHaveLength(1);
+    expect(parsed.toolCalls[0]).toMatchObject({ id: "dup", name: "Read", kind: "tool" });
+  });
+
+  it("returns toolCalls even when no terminal result is present", () => {
+    const stdout = assistantLine([{ type: "tool_use", id: "t9", name: "Grep", input: { pattern: "foo" } }]);
+    const parsed = parseClaudeStreamJson(stdout);
+    expect(parsed.resultJson).toBeNull();
+    expect(parsed.toolCalls).toHaveLength(1);
+    expect(parsed.toolCalls[0]).toMatchObject({ name: "Grep", kind: "tool" });
+  });
+});
 
 describe("isClaudeTransientUpstreamError", () => {
   it("classifies the 'out of extra usage' subscription window failure as transient", () => {

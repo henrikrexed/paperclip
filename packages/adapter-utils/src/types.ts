@@ -66,6 +66,29 @@ export interface AdapterRuntimeServiceReport {
 
 export type AdapterExecutionErrorFamily = "transient_upstream";
 
+/**
+ * A tool/MCP/skill invocation the agent runtime made during a run.
+ *
+ * Vendor-neutral: any adapter that can observe its agent's tool calls may
+ * report them so the observability plugin can build named child spans under
+ * the run span. `kind` classifies the call so MCP servers and skills get
+ * distinct span detail from ordinary tools.
+ */
+export interface AdapterToolCallReport {
+  /** Provider tool-use id (e.g. Anthropic `tool_use` block id), when known. */
+  id?: string | null;
+  /** Raw tool name as emitted by the runtime (e.g. "Bash", "mcp__server__tool", "Skill"). */
+  name: string;
+  /** Classification derived from the tool name. */
+  kind: "mcp" | "skill" | "tool";
+  /** For MCP calls: the MCP server segment of the tool name. */
+  mcpServer?: string | null;
+  /** For skill calls: the resolved skill name. */
+  skillName?: string | null;
+  /** Compact, truncated preview of the tool input for span detail. */
+  inputSummary?: string | null;
+}
+
 export interface AdapterExecutionResult {
   exitCode: number | null;
   signal: string | null;
@@ -88,6 +111,7 @@ export interface AdapterExecutionResult {
   billingType?: AdapterBillingType | null;
   costUsd?: number | null;
   resultJson?: Record<string, unknown> | null;
+  toolCalls?: AdapterToolCallReport[];
   runtimeServices?: AdapterRuntimeServiceReport[];
   summary?: string | null;
   clearSession?: boolean;

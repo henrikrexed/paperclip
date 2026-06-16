@@ -147,6 +147,58 @@ describe("handleActivityTraces", () => {
     expect(tracer._lastSpan!._ended).toBe(true);
   });
 
+  it("attaches MCP detail (server name, tool type) to the child span", async () => {
+    const { ctx, tracer } = createTestTelemetryCtx();
+    const runSpan = createMockSpan();
+    ctx.activeRunSpans.set("run-1", runSpan);
+
+    await handleActivityTraces(
+      makeEvent("activity.logged", {
+        runId: "run-1",
+        agentId: "agent-1",
+        action: "tool.mcp__mempalace__mempalace_search",
+        entityType: "tool",
+        entityId: "tu-1",
+        details: { toolKind: "mcp", mcpServer: "mempalace", toolCallId: "tu-1" },
+      }),
+      ctx,
+    );
+
+    expect(tracer._lastSpan!._name).toBe("mcp__mempalace__mempalace_search");
+    expect(tracer._lastSpan!._attributes).toMatchObject({
+      "gen_ai.tool.name": "mcp__mempalace__mempalace_search",
+      "gen_ai.tool.type": "mcp",
+      "mcp.server.name": "mempalace",
+      "gen_ai.tool.call.id": "tu-1",
+    });
+    expect(tracer._lastSpan!._ended).toBe(true);
+  });
+
+  it("attaches skill detail (skill name, tool type) to the child span", async () => {
+    const { ctx, tracer } = createTestTelemetryCtx();
+    const runSpan = createMockSpan();
+    ctx.activeRunSpans.set("run-1", runSpan);
+
+    await handleActivityTraces(
+      makeEvent("activity.logged", {
+        runId: "run-1",
+        agentId: "agent-1",
+        action: "tool.skill.blog-write",
+        entityType: "tool",
+        details: { toolKind: "skill", skillName: "blog-write" },
+      }),
+      ctx,
+    );
+
+    expect(tracer._lastSpan!._name).toBe("skill.blog-write");
+    expect(tracer._lastSpan!._attributes).toMatchObject({
+      "gen_ai.tool.name": "skill.blog-write",
+      "gen_ai.tool.type": "skill",
+      "paperclip.skill.name": "blog-write",
+    });
+    expect(tracer._lastSpan!._ended).toBe(true);
+  });
+
   it("creates standalone span when no active run span exists", async () => {
     const { ctx, tracer } = createTestTelemetryCtx();
 

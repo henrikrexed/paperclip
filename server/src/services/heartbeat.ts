@@ -9103,6 +9103,42 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           }
         }
       }
+      // Emit one activity per tool/MCP/skill call the agent made so the
+      // observability plugin builds named child spans under the run span.
+      // Best-effort: telemetry must never fail or stall the run.
+      if (Array.isArray(adapterResult.toolCalls) && adapterResult.toolCalls.length > 0) {
+        for (const call of adapterResult.toolCalls) {
+          const spanName =
+            call.kind === "skill" && call.skillName ? `skill.${call.skillName}` : call.name;
+          try {
+            await logActivity(db, {
+              companyId: run.companyId,
+              actorType: "agent",
+              actorId: run.agentId,
+              action: `tool.${spanName}`,
+              entityType: "tool",
+              entityId: call.id ?? spanName,
+              agentId: run.agentId,
+              runId: run.id,
+              details: {
+                agentName: agent.name,
+                toolName: call.name,
+                toolKind: call.kind,
+                toolCallId: call.id ?? null,
+                mcpServer: call.mcpServer ?? null,
+                skillName: call.skillName ?? null,
+                input: call.inputSummary ?? null,
+              },
+            });
+          } catch (err) {
+            logger.warn(
+              { err, runId: run.id, tool: call.name },
+              "failed to log tool-call activity for observability",
+            );
+          }
+        }
+      }
+
       let outcome: RunSessionOutcome;
       const latestRun = await getRun(run.id);
       if (isHeartbeatRunTerminalStatus(latestRun?.status)) {

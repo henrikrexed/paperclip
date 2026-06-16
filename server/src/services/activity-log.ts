@@ -37,9 +37,15 @@ export function setPluginEventBus(bus: PluginEventBus): void {
   _pluginEventBus = bus;
 }
 
-function eventTypeForActivityAction(action: string): PluginEventType | null {
+function eventTypeForActivityAction(action: string, entityType: string): PluginEventType | null {
   if (PLUGIN_EVENT_SET.has(action)) return action as PluginEventType;
-  return ACTIVITY_ACTION_TO_PLUGIN_EVENT[action.replaceAll(".", "_")] ?? null;
+  const mapped = ACTIVITY_ACTION_TO_PLUGIN_EVENT[action.replaceAll(".", "_")];
+  if (mapped) return mapped;
+  // Tool/MCP/skill invocations surface as activity.logged so the observability
+  // plugin can build named child tool spans under the run span (resolveToolName
+  // keys on the `tool.` action prefix / `tool` entity type).
+  if (action.startsWith("tool.") || entityType === "tool") return "activity.logged";
+  return null;
 }
 
 export function publishPluginDomainEvent(event: PluginEvent): void {
@@ -98,7 +104,7 @@ export async function logActivity(db: Db, input: LogActivityInput) {
     },
   });
 
-  const pluginEventType = eventTypeForActivityAction(input.action);
+  const pluginEventType = eventTypeForActivityAction(input.action, input.entityType);
   if (pluginEventType) {
     const traceContext = extractTraceContext();
     const event: PluginEvent = {
@@ -112,6 +118,10 @@ export async function logActivity(db: Db, input: LogActivityInput) {
       companyId: input.companyId,
       payload: {
         ...redactedDetails,
+        action: input.action,
+        entityType: input.entityType,
+        entityId: input.entityId,
+        actorType: input.actorType,
         agentId: input.agentId ?? null,
         runId: input.runId ?? null,
       },
