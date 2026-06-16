@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import type { AdapterStreamEvent } from "@paperclipai/adapter-utils";
 import {
   extractClaudeRetryNotBefore,
   isClaudeTransientUpstreamError,
@@ -6,6 +7,7 @@ import {
   isClaudeUnknownSessionError,
   isClaudeImageProcessingError,
   parseClaudeStreamJson,
+  createClaudeStreamEventParser,
 } from "./parse.js";
 
 describe("parseClaudeStreamJson tool_use extraction", () => {
@@ -57,6 +59,127 @@ describe("parseClaudeStreamJson tool_use extraction", () => {
     expect(parsed.resultJson).toBeNull();
     expect(parsed.toolCalls).toHaveLength(1);
     expect(parsed.toolCalls[0]).toMatchObject({ name: "Grep", kind: "tool" });
+  });
+});
+
+describe("createClaudeStreamEventParser", () => {
+  function assistantTurn(opts: {
+    id: string;
+    model?: string;
+    usage?: Record<string, number>;
+    stopReason?: string;
+    content?: unknown[];
+  }): string {
+    return JSON.stringify({
+      type: "assistant",
+      session_id: "sess-1",
+      message: {
+        id: opts.id,
+        model: opts.model ?? "claude-opus-4-8",
+        stop_reason: opts.stopReason ?? "end_turn",
+        usage: opts.usage ?? { input_tokens: 10, output_tokens: 5, cache_read_input_tokens: 2 },
+        content: opts.content ?? [{ type: "text", text: "hi" }],
+      },
+    });
+  }
+
+  it("emits one chat_turn per assistant message with per-turn usage", async () => {
+    const events: AdapterStreamEvent[] = [];
+    const parser = createClaudeStreamEventParser((e) => {
+      events.push(e);
+    });
+
+    await parser.ingest(
+      JSON.stringify({ type: "system", subtype: "init", model: "claude-opus-4-8" }) + "\n",
+    );
+    await parser.ingest(
+      assistantTurn({ id: "m1", usage: { input_tokens: 100, output_tokens: 20, cache_read_input_tokens: 8 } }) + "\n",
+    );
+    await parser.ingest(
+      assistantTurn({ id: "m2", usage: { input_tokens: 50, output_tokens: 12 }, stopReason: "tool_use" }) + "\n",
+    );
+    await parser.flush();
+
+    const chatTurns = events.filter((e) => e.kind === "chat_turn");
+    expect(chatTurns).toHaveLength(2);
+    expect(chatTurns[0]).toMatchObject({
+      kind: "chat_turn",
+      model: "claude-opus-4-8",
+      turnIndex: 0,
+      stopReason: "end_turn",
+      usage: { inputTokens: 100, outputTokens: 20, cachedInputTokens: 8 },
+    });
+    expect(chatTurns[1]).toMatchObject({
+      kind: "chat_turn",
+      turnIndex: 1,
+      stopReason: "tool_use",
+      usage: { inputTokens: 50, outputTokens: 12, cachedInputTokens: 0 },
+    });
+  });
+
+  it("emits tool_call events classified by type alongside chat turns", async () => {
+    const events: AdapterStreamEvent[] = [];
+    const parser = createClaudeStreamEventParser((e) => {
+      events.push(e);
+    });
+
+    await parser.ingest(
+      assistantTurn({
+        id: "m1",
+        content: [
+          { type: "text", text: "working" },
+          { type: "tool_use", id: "t1", name: "Bash", input: { command: "ls" } },
+          { type: "tool_use", id: "t2", name: "mcp__mempalace__mempalace_search", input: { query: "x" } },
+          { type: "tool_use", id: "t3", name: "Skill", input: { skill: "blog-write" } },
+        ],
+      }) + "\n",
+    );
+    await parser.flush();
+
+    const toolCalls = events.filter((e) => e.kind === "tool_call");
+    expect(toolCalls).toHaveLength(3);
+    expect(toolCalls[0]).toMatchObject({ kind: "tool_call", call: { id: "t1", name: "Bash", kind: "tool" } });
+    expect(toolCalls[1]).toMatchObject({
+      kind: "tool_call",
+      call: { id: "t2", kind: "mcp", mcpServer: "mempalace" },
+    });
+    expect(toolCalls[2]).toMatchObject({
+      kind: "tool_call",
+      call: { id: "t3", kind: "skill", skillName: "blog-write" },
+    });
+  });
+
+  it("dedupes assistant turns by message id and tool calls by tool_use id", async () => {
+    const events: AdapterStreamEvent[] = [];
+    const parser = createClaudeStreamEventParser((e) => {
+      events.push(e);
+    });
+
+    const turn = assistantTurn({
+      id: "dup",
+      content: [{ type: "tool_use", id: "tdup", name: "Read", input: { path: "a" } }],
+    });
+    await parser.ingest(turn + "\n");
+    await parser.ingest(turn + "\n");
+    await parser.flush();
+
+    expect(events.filter((e) => e.kind === "chat_turn")).toHaveLength(1);
+    expect(events.filter((e) => e.kind === "tool_call")).toHaveLength(1);
+  });
+
+  it("reassembles JSON lines split across chunk boundaries", async () => {
+    const events: AdapterStreamEvent[] = [];
+    const parser = createClaudeStreamEventParser((e) => {
+      events.push(e);
+    });
+
+    const line = assistantTurn({ id: "m1" }) + "\n";
+    const mid = Math.floor(line.length / 2);
+    await parser.ingest(line.slice(0, mid));
+    await parser.ingest(line.slice(mid));
+    await parser.flush();
+
+    expect(events.filter((e) => e.kind === "chat_turn")).toHaveLength(1);
   });
 });
 

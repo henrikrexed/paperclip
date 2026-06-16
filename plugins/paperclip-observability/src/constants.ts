@@ -58,6 +58,9 @@ export const METRIC_NAMES = {
   sessionToolExecutions: "paperclip.agent.session.tool_executions",
   sessionChatTurns: "paperclip.agent.session.chat_turns",
 
+  // Run-level per-turn chat metrics (real claude_local run path)
+  runChatTurns: "paperclip.agent.run.chat_turns",
+
   // Activity observability metrics
   activityCount: "paperclip.agent.activity.count",
   activityActorCount: "paperclip.agent.activity.actor_count",

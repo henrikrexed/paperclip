@@ -91,7 +91,7 @@ import {
   type RunLivenessClassificationInput,
 } from "./run-liveness.js";
 import { logActivity, publishPluginDomainEvent, type LogActivityInput } from "./activity-log.js";
-import { withHeartbeatSpan, withIssueSpan, extractTraceContext } from "./trace-context.js";
+import { withHeartbeatSpan, withIssueSpan, extractTraceContext, bindActiveContext } from "./trace-context.js";
 import {
   buildWorkspaceReadyComment,
   cleanupExecutionWorkspaceArtifacts,
@@ -181,6 +181,7 @@ import {
   hasSessionCompactionThresholds,
   resolveSessionCompactionPolicy,
   type SessionCompactionPolicy,
+  type AdapterStreamEvent,
 } from "@paperclipai/adapter-utils";
 import {
   readPaperclipSkillSyncPreference,
@@ -9021,6 +9022,69 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         adapterFinalizeOutcome = status;
       };
 
+      // Tool-call ids streamed live during execution. The post-execute
+      // toolCalls loop below skips these so a call is not double-emitted.
+      const streamedToolCallIds = new Set<string>();
+      // Per-turn streaming telemetry sink. Captured inside the run span via
+      // bindActiveContext so events fired from the adapter's stdout handler
+      // (which runs outside the OTel ALS context) still resolve the run span
+      // through extractTraceContext() and parent correctly under it.
+      const onStreamEvent = bindActiveContext(async (event: AdapterStreamEvent) => {
+        try {
+          if (event.kind === "chat_turn") {
+            await logActivity(db, {
+              companyId: run.companyId,
+              actorType: "agent",
+              actorId: run.agentId,
+              action: "agent.run.chat",
+              entityType: "chat_turn",
+              entityId: `${run.id}:${event.turnIndex}`,
+              agentId: run.agentId,
+              runId: run.id,
+              details: {
+                agentName: agent.name,
+                model: event.model,
+                inputTokens: event.usage.inputTokens,
+                outputTokens: event.usage.outputTokens,
+                cachedInputTokens: event.usage.cachedInputTokens ?? 0,
+                stopReason: event.stopReason ?? null,
+                turnIndex: event.turnIndex,
+                heartbeatRunId: run.id,
+              },
+            });
+          } else {
+            const call = event.call;
+            const spanName =
+              call.kind === "skill" && call.skillName ? `skill.${call.skillName}` : call.name;
+            streamedToolCallIds.add(call.id ?? spanName);
+            await logActivity(db, {
+              companyId: run.companyId,
+              actorType: "agent",
+              actorId: run.agentId,
+              action: `tool.${spanName}`,
+              entityType: "tool",
+              entityId: call.id ?? spanName,
+              agentId: run.agentId,
+              runId: run.id,
+              details: {
+                agentName: agent.name,
+                toolName: call.name,
+                toolKind: call.kind,
+                toolCallId: call.id ?? null,
+                mcpServer: call.mcpServer ?? null,
+                skillName: call.skillName ?? null,
+                input: call.inputSummary ?? null,
+              },
+            });
+          }
+        } catch (err) {
+          logger.warn(
+            { err, runId: run.id, streamEventKind: event.kind },
+            "failed to log per-turn stream event for observability",
+          );
+        }
+      });
+
       let adapterResult: Awaited<ReturnType<typeof adapter.execute>>;
       try {
         adapterResult = await adapter.execute({
@@ -9036,6 +9100,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             : undefined,
           onLog,
           onMeta: onAdapterMeta,
+          onStreamEvent,
           onSpawn: async (meta) => {
             await persistRunProcessMetadata(run.id, {
               pid: meta.pid,
@@ -9128,6 +9193,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         for (const call of adapterResult.toolCalls) {
           const spanName =
             call.kind === "skill" && call.skillName ? `skill.${call.skillName}` : call.name;
+          // Skip calls already emitted live by the streaming sink above.
+          if (streamedToolCallIds.has(call.id ?? spanName)) continue;
           try {
             await logActivity(db, {
               companyId: run.companyId,

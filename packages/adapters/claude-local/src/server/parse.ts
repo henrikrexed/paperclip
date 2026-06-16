@@ -1,4 +1,4 @@
-import type { AdapterToolCallReport, UsageSummary } from "@paperclipai/adapter-utils";
+import type { AdapterStreamEvent, AdapterToolCallReport, UsageSummary } from "@paperclipai/adapter-utils";
 import {
   asString,
   asNumber,
@@ -136,6 +136,101 @@ export function parseClaudeStreamJson(stdout: string) {
     summary,
     resultJson: finalResult,
     toolCalls,
+  };
+}
+
+/**
+ * Incremental stream-json parser for live per-turn telemetry.
+ *
+ * Unlike {@link parseClaudeStreamJson} — which decodes the full stdout once the
+ * subprocess exits to build the aggregate result — this consumes stdout chunks
+ * as they arrive and invokes `onEvent` for each assistant turn (carrying that
+ * turn's token usage) and each tool_use block (classified by type). The runner
+ * forwards these to the observability layer so the run span gets per-turn child
+ * spans instead of a single aggregate `chat <model>` span.
+ *
+ * The parser buffers partial lines across chunk boundaries and dedupes both
+ * assistant turns (by message id) and tool calls (by tool_use id), since a
+ * streamed block can repeat before it finalizes.
+ */
+export function createClaudeStreamEventParser(
+  onEvent: (event: AdapterStreamEvent) => void | Promise<void>,
+): { ingest(chunk: string): Promise<void>; flush(): Promise<void> } {
+  let buffer = "";
+  let model = "";
+  let turnIndex = 0;
+  const seenToolUseIds = new Set<string>();
+  const seenMessageIds = new Set<string>();
+
+  const processLine = async (rawLine: string): Promise<void> => {
+    const line = rawLine.trim();
+    if (!line) return;
+    const event = parseJson(line);
+    if (!event) return;
+
+    const type = asString(event.type, "");
+    if (type === "system" && asString(event.subtype, "") === "init") {
+      model = asString(event.model, model) || model;
+      return;
+    }
+    if (type !== "assistant") return;
+
+    const message = parseObject(event.message);
+    const messageId = asString(message.id, "") || null;
+    const turnModel = asString(message.model, model) || model;
+
+    // Emit one chat-turn event per assistant turn (deduped by message id).
+    if (!messageId || !seenMessageIds.has(messageId)) {
+      if (messageId) seenMessageIds.add(messageId);
+      const usageObj = parseObject(message.usage);
+      const usage: UsageSummary = {
+        inputTokens: asNumber(usageObj.input_tokens, 0),
+        cachedInputTokens: asNumber(usageObj.cache_read_input_tokens, 0),
+        outputTokens: asNumber(usageObj.output_tokens, 0),
+      };
+      const stopReason = asString(message.stop_reason, "") || null;
+      await onEvent({
+        kind: "chat_turn",
+        model: turnModel,
+        usage,
+        stopReason,
+        turnIndex: turnIndex++,
+      });
+    }
+
+    // Emit one tool-call event per tool_use block (deduped by tool_use id).
+    const content = Array.isArray(message.content) ? message.content : [];
+    for (const entry of content) {
+      if (typeof entry !== "object" || entry === null || Array.isArray(entry)) continue;
+      const block = entry as Record<string, unknown>;
+      if (asString(block.type, "") !== "tool_use") continue;
+      const name = asString(block.name, "");
+      if (!name) continue;
+      const id = asString(block.id, "");
+      if (id && seenToolUseIds.has(id)) continue;
+      if (id) seenToolUseIds.add(id);
+      const call = classifyClaudeToolUse(name, parseObject(block.input));
+      await onEvent({ kind: "tool_call", call: id ? { ...call, id } : call });
+    }
+  };
+
+  return {
+    async ingest(chunk: string): Promise<void> {
+      buffer += chunk;
+      let newlineIdx = buffer.indexOf("\n");
+      while (newlineIdx >= 0) {
+        const line = buffer.slice(0, newlineIdx);
+        buffer = buffer.slice(newlineIdx + 1);
+        await processLine(line);
+        newlineIdx = buffer.indexOf("\n");
+      }
+    },
+    async flush(): Promise<void> {
+      if (buffer.length === 0) return;
+      const remaining = buffer;
+      buffer = "";
+      await processLine(remaining);
+    },
   };
 }
 

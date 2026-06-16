@@ -58,6 +58,8 @@ import {
   handleRunFailedTraces,
   handleRunCancelledTraces,
   handleCostTraces,
+  handleRunChatTraces,
+  handleRunChatMetrics,
   handleIssueCreatedTraces,
   handleIssueUpdatedTraces,
   handleIssueCommentCreatedTraces,
@@ -226,6 +228,10 @@ function createRouter(): EventTelemetryRouter {
   router.register("cost_event.created", handleCostTraces);
   router.register("cost_event.created", handleCostEventLogs);
 
+  // agent.run.chat — per-LLM-turn chat spans on the real run path
+  router.register("agent.run.chat", handleRunChatTraces);
+  router.register("agent.run.chat", handleRunChatMetrics);
+
   // issue.created
   router.register("issue.created", handleIssueCreatedMetrics);
   router.register("issue.created", handleIssueCreatedTraces);
@@ -367,6 +373,7 @@ const plugin: PaperclipPlugin = definePlugin({
       "agent.run.finished",
       "agent.run.failed",
       "agent.run.cancelled",
+      "agent.run.chat",
       "cost_event.created",
       "issue.created",
       "issue.comment.created",

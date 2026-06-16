@@ -32,6 +32,7 @@ import type { TelemetryContext } from "../src/telemetry/router.js";
 import {
   handleRunStartedTraces,
   handleCostTraces,
+  handleRunChatTraces,
 } from "../src/telemetry/trace-handlers.js";
 import { handleDbQueryTraces } from "../src/telemetry/db-query-handlers.js";
 import {
@@ -235,6 +236,24 @@ describe("OTLP-egress new span families (ISI-1310 M6)", () => {
       ctx,
     );
 
+    // 3b. agent.run.chat → per-LLM-turn chat <model> span under the RUN span
+    //     (real claude_local run path — ISI-1323), distinct from the session path.
+    await handleRunChatTraces(
+      makeEvent("agent.run.chat", {
+        agentId: AGENT_ID,
+        agentName: AGENT_NAME,
+        heartbeatRunId: RUN_ID,
+        runId: RUN_ID,
+        model: MODEL,
+        inputTokens: 120,
+        outputTokens: 30,
+        cachedInputTokens: 10,
+        stopReason: "tool_use",
+        turnIndex: 0,
+      }),
+      ctx,
+    );
+
     // 4. agent.session.created → paperclip.agent.session under the run span.
     await handleSessionCreatedTraces(
       makeEvent("agent.session.created", {
@@ -305,6 +324,18 @@ describe("OTLP-egress new span families (ISI-1310 M6)", () => {
 
     const skillSpan = captured.find((s) => s.name === "skill dt-app-dashboards");
     expect(skillSpan?.attributes["paperclip.skill.name"]).toBe("dt-app-dashboards");
+
+    // The run-path chat turn is a `chat <model>` span carrying the per-turn
+    // index + run id (distinguishes it from the cost/session chat spans).
+    const runChatSpan = captured.find(
+      (s) => s.name === `chat ${MODEL}` && s.attributes["paperclip.chat.turn_index"] !== undefined,
+    );
+    expect(runChatSpan, "run-path chat turn span").toBeDefined();
+    expect(runChatSpan?.attributes["paperclip.run.id"]).toBe(RUN_ID);
+    expect(runChatSpan?.attributes["gen_ai.usage.input_tokens"]).toBe(120);
+    expect(runChatSpan?.attributes["gen_ai.usage.output_tokens"]).toBe(30);
+    expect(runChatSpan?.attributes["gen_ai.usage.cached_input_tokens"]).toBe(10);
+    expect(runChatSpan?.attributes["gen_ai.response.finish_reasons"]).toBe("tool_use");
 
     // --- All families share the one server-rooted trace (distributed linkage) ---
     for (const s of captured) {

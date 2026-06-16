@@ -89,6 +89,30 @@ export interface AdapterToolCallReport {
   inputSummary?: string | null;
 }
 
+/**
+ * A per-turn streaming telemetry event emitted by an adapter as its agent
+ * runtime streams output, before the aggregate result is returned.
+ *
+ * `chat_turn` fires once per assistant LLM turn carrying that turn's token
+ * usage; `tool_call` fires once per tool/MCP/skill invocation. Adapters emit
+ * these via `AdapterExecutionContext.onStreamEvent` so the observability layer
+ * can build per-turn child spans under the run span instead of a single
+ * aggregate span.
+ */
+export type AdapterStreamEvent =
+  | {
+      kind: "chat_turn";
+      model: string;
+      usage: UsageSummary;
+      stopReason?: string | null;
+      /** Zero-based index of this assistant turn within the run. */
+      turnIndex: number;
+    }
+  | {
+      kind: "tool_call";
+      call: AdapterToolCallReport;
+    };
+
 export interface AdapterExecutionResult {
   exitCode: number | null;
   signal: string | null;
@@ -161,6 +185,13 @@ export interface AdapterExecutionContext {
   onLog: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
   onMeta?: (meta: AdapterInvocationMeta) => Promise<void>;
   onSpawn?: (meta: { pid: number; processGroupId: number | null; startedAt: string }) => Promise<void>;
+  /**
+   * Per-turn streaming telemetry sink. Adapters that can observe their agent's
+   * stream (e.g. claude_local's stream-json output) call this once per
+   * assistant turn and once per tool/MCP/skill call so the run span gets
+   * per-turn child spans. Best-effort: invocations must never break the run.
+   */
+  onStreamEvent?: (event: AdapterStreamEvent) => Promise<void>;
   authToken?: string;
 }
 

@@ -783,6 +783,115 @@ export async function handleCostTraces(
 }
 
 // ---------------------------------------------------------------------------
+// agent.run.chat — per-LLM-turn chat span under the heartbeat run span
+//
+// Fired by the server once per assistant turn as the real claude_local run
+// streams (not the synthetic agent.session.* path). Each turn carries that
+// turn's token usage and is parented under the run span so a real run shows a
+// `chat <model>` span per turn instead of a single aggregate cost span.
+// ---------------------------------------------------------------------------
+
+export async function handleRunChatTraces(
+  event: PluginEvent,
+  ctx: TelemetryContext,
+): Promise<void> {
+  const p = event.payload as Record<string, unknown>;
+  const heartbeatRunId = String(p.heartbeatRunId ?? p.runId ?? "");
+  const agentId = String(p.agentId ?? "");
+  const agentName = String(p.agentName ?? "") || ctx.agentNameMap.get(agentId) || "";
+  const model = String(p.model ?? "unknown");
+  const inputTokens = Number(p.inputTokens ?? 0);
+  const outputTokens = Number(p.outputTokens ?? 0);
+  const cachedInputTokens = Number(p.cachedInputTokens ?? 0);
+  const stopReason = p.stopReason != null ? String(p.stopReason) : undefined;
+  const turnIndex = Number(p.turnIndex ?? 0);
+
+  const tracer = ctx.getTracerForAgent(agentId, agentName);
+
+  // Parent resolution mirrors handleCostTraces: live run span → ended run span
+  // context → server-propagated trace context → persisted run span state.
+  let parentSpan = heartbeatRunId
+    ? ctx.activeRunSpans.get(heartbeatRunId)
+    : undefined;
+  let parentCtx = parentSpan
+    ? trace.setSpan(context.active(), parentSpan)
+    : undefined;
+
+  if (!parentCtx && heartbeatRunId) {
+    const ended = ctx.endedRunSpanContexts.get(heartbeatRunId);
+    if (ended) {
+      parentCtx = trace.setSpanContext(context.active(), {
+        traceId: ended.traceId,
+        spanId: ended.spanId,
+        traceFlags: ended.traceFlags,
+        isRemote: true,
+      });
+    }
+  }
+
+  if (!parentCtx) {
+    parentCtx = parentCtxFromServerTrace(event);
+  }
+
+  if (!parentCtx && heartbeatRunId) {
+    const stored = await ctx.state
+      .get({ scopeKind: "instance", stateKey: `span:run:${heartbeatRunId}` })
+      .catch(() => null);
+    if (
+      stored &&
+      typeof stored === "object" &&
+      "traceId" in (stored as Record<string, unknown>) &&
+      "spanId" in (stored as Record<string, unknown>)
+    ) {
+      const s = stored as { traceId: string; spanId: string; traceFlags: number };
+      parentCtx = trace.setSpanContext(context.active(), {
+        traceId: s.traceId,
+        spanId: s.spanId,
+        traceFlags: s.traceFlags ?? 1,
+        isRemote: true,
+      });
+    }
+  }
+
+  const attributes: Record<string, string | number> = {
+    "paperclip.agent.id": agentId,
+    "paperclip.agent.name": agentName,
+    "paperclip.run.id": heartbeatRunId,
+    "paperclip.chat.turn_index": turnIndex,
+    "gen_ai.operation.name": "chat",
+    "gen_ai.system": "anthropic",
+    "gen_ai.request.model": model,
+    "gen_ai.response.model": model,
+    "gen_ai.usage.input_tokens": inputTokens,
+    "gen_ai.usage.output_tokens": outputTokens,
+    "gen_ai.usage.cached_input_tokens": cachedInputTokens,
+    "gen_ai.usage.total_tokens": inputTokens + outputTokens,
+    ...(stopReason ? { "gen_ai.response.finish_reasons": stopReason } : {}),
+  };
+
+  const span = parentCtx
+    ? tracer.startSpan(`chat ${model}`, { kind: SpanKind.CLIENT, attributes }, parentCtx)
+    : tracer.startSpan(`chat ${model}`, { kind: SpanKind.CLIENT, attributes });
+  span.setStatus({ code: SpanStatusCode.OK });
+  span.end();
+}
+
+export async function handleRunChatMetrics(
+  event: PluginEvent,
+  ctx: TelemetryContext,
+): Promise<void> {
+  const p = event.payload as Record<string, unknown>;
+  const chatCounter = ctx.meter.createCounter(METRIC_NAMES.runChatTurns, {
+    description: "Count of LLM chat turns observed on real agent run paths",
+  });
+  chatCounter.add(1, {
+    agent_id: String(p.agentId ?? ""),
+    agent_name: String(p.agentName ?? ""),
+    model: String(p.model ?? "unknown"),
+  });
+}
+
+// ---------------------------------------------------------------------------
 // issue.created — start issue lifecycle span at creation time
 // ---------------------------------------------------------------------------
 
