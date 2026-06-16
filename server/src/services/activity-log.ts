@@ -9,6 +9,7 @@ import { sanitizeRecord } from "../redaction.js";
 import { logger } from "../middleware/logger.js";
 import type { PluginEventBus } from "./plugin-event-bus.js";
 import { instanceSettingsService } from "./instance-settings.js";
+import { extractTraceContext } from "./trace-context.js";
 
 const PLUGIN_EVENT_SET: ReadonlySet<string> = new Set(PLUGIN_EVENT_TYPES);
 const ACTIVITY_ACTION_TO_PLUGIN_EVENT: Readonly<Record<string, PluginEventType>> = {
@@ -99,6 +100,7 @@ export async function logActivity(db: Db, input: LogActivityInput) {
 
   const pluginEventType = eventTypeForActivityAction(input.action);
   if (pluginEventType) {
+    const traceContext = extractTraceContext();
     const event: PluginEvent = {
       eventId: randomUUID(),
       eventType: pluginEventType,
@@ -113,6 +115,7 @@ export async function logActivity(db: Db, input: LogActivityInput) {
         agentId: input.agentId ?? null,
         runId: input.runId ?? null,
       },
+      ...(traceContext ? { traceContext } : {}),
     };
     publishPluginDomainEvent(event);
   }

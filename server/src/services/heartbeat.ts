@@ -90,6 +90,7 @@ import {
   type RunLivenessClassificationInput,
 } from "./run-liveness.js";
 import { logActivity, publishPluginDomainEvent, type LogActivityInput } from "./activity-log.js";
+import { withHeartbeatSpan, withIssueSpan } from "./trace-context.js";
 import {
   buildWorkspaceReadyComment,
   cleanupExecutionWorkspaceArtifacts,
@@ -7757,6 +7758,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     activeRunExecutions.add(run.id);
 
+    const heartbeatRunIssueId = readNonEmptyString(parseObject(run.contextSnapshot).issueId);
+    const runWithinHeartbeatSpan = async () => {
     try {
     const agent = await getAgent(run.agentId);
     if (!agent) {
@@ -9511,6 +9514,25 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           activeRunExecutions.delete(run.id);
           await startNextQueuedRunForAgent(run.agentId);
         }
+    };
+
+    await withHeartbeatSpan(
+      run.id,
+      run.agentId,
+      {
+        "paperclip.company.id": run.companyId,
+        "paperclip.run.invocation_source": run.invocationSource ?? "",
+      },
+      heartbeatRunIssueId
+        ? () =>
+            withIssueSpan(
+              "execution",
+              heartbeatRunIssueId,
+              { "paperclip.agent.id": run.agentId },
+              runWithinHeartbeatSpan,
+            )
+        : runWithinHeartbeatSpan,
+    );
   }
 
   function buildImmediateExecutionPathRecoveryComment(input: {
